@@ -18,17 +18,33 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
+# WGMMA (.wgmma.mma_async) PTX 只能由 sm_90a 生成；但本机 torch 2.1.2 的
+# cpp_extension 不认 "9.0a" 这种带 a 后缀的 arch 列表（会报 Unknown CUDA arch）。
+# 因此这里只锁成 9.0（让 torch 生成 sm_90 的代码），真正的 sm_90a 代码生成
+# 由下方 extra_cuda_cflags 里的 -gencode=arch=compute_90a,code=sm_90a 负责。
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "9.0")
+
 
 def _ensure_nvidia_libs():
     """pip 版 torch 把 cudnn/cublas 等拆到 nvidia-* 包，其 .so 不在链接器默认
     搜索路径。必须在 python 启动前把它们的 lib 目录加入 LD_LIBRARY_PATH；
-    若缺失则 re-exec 自身（新进程启动时链接器才能读到）。"""
+    若缺失则 re-exec 自身（新进程启动时链接器才能读到）。
+
+    另外还要把构建 flash-attn 所用的 conda 环境 lib 目录加进来：用 gcc 11.4
+    编出的扩展 .so 依赖 GLIBCXX_3.4.29，而本机默认 / IDE 自带的 libstdc++ 较旧，
+    不加会导致 import 时 "GLIBCXX_3.4.29 not found"。"""
     dirs = []
     for sp in site.getsitepackages():
         for d in sorted(glob.glob(os.path.join(sp, "nvidia", "*"))):
             lib = os.path.join(d, "lib")
             if os.path.isdir(lib):
                 dirs.append(lib)
+    # conda env 的 lib（提供 GLIBCXX_3.4.29）
+    here = Path(__file__).resolve().parent
+    fa = os.path.realpath(os.path.join(here, "third_party", "flashattention"))
+    env_lib = os.path.join(os.path.dirname(fa), "env", "lib")
+    if os.path.isdir(env_lib):
+        dirs.append(env_lib)
     if not dirs:
         return
     cur = os.environ.get("LD_LIBRARY_PATH", "")
@@ -43,9 +59,9 @@ _ensure_nvidia_libs()
 
 
 def _pick_cxx():
-    """torch 2.4+ 头文件要求 GCC 9+；nvcc 12.1 不认 GCC 13。
-    挑一个主版本落在 [9, 12] 区间内的编译器，写进 CXX/CC
-    （torch 的 cpp_extension 会读这个环境变量；nvcc 用 -allow-unsupported-compiler 放行）。"""
+    """torch 头文件要求 GCC 9+；nvcc 用 -allow-unsupported-compiler 放行更新的 GCC。
+    挑一个主版本落在 [9, 13] 区间内的编译器，写进 CXX/CC。-allow-unsupported-compiler
+    已经在 extra_cuda_cflags 里，所以 13 也能用。"""
     def ver(cxx):
         try:
             out = subprocess.run([cxx, "-dumpversion"], capture_output=True,
@@ -56,25 +72,44 @@ def _pick_cxx():
             return (0, 0)
 
     def ok(v):
+        # 上限 12：gcc 13 与本项目所用的 CUTLASS 不兼容（signum 重载缺失），
+        # 即使有 -allow-unsupported-compiler 也会编译失败。
         return (9, 0) <= v <= (12, 99)
 
+    def set_if_ok(cxx):
+        try:
+            cxx = shutil.which(cxx) or cxx
+        except Exception:
+            pass
+        if cxx and ok(ver(cxx)):
+            os.environ["CXX"] = cxx
+            os.environ["CC"] = cxx.replace("g++", "gcc").replace("c++", "gcc")
+            return True
+        return False
+
     cur = os.environ.get("CXX", "g++")
-    if ok(ver(cur)):
+    if set_if_ok(cur):
         return
-    # 1) gcc-toolset：选最高且主版本 <= 12 的
+    # 1) gcc-toolset：选最高且主版本 <= 13 的（gcc-toolset-12/13 等）
     for cand in sorted(glob.glob("/opt/rh/gcc-toolset-*/root/usr/bin/c++"), reverse=True):
-        if ok(ver(cand)):
-            os.environ["CXX"] = cand
-            os.environ["CC"] = cand.replace("/c++", "/gcc")
+        if set_if_ok(cand):
             return
     # 2) 常见命名 g++-N
-    for name in ("g++-12", "g++-11", "g++-10", "g++-9"):
-        p = shutil.which(name)
-        if p and ok(ver(p)):
-            os.environ["CXX"] = p
-            os.environ["CC"] = p.replace("g++", "gcc")
+    for name in ("g++-13", "g++-12", "g++-11", "g++-10", "g++-9"):
+        if set_if_ok(name):
             return
-    # 3) 系统默认 g++，若恰好落在 [9, 12] 区间内则直接用
+    # 3) conda / 第三方环境里的交叉 gcc（如构建 flash-attn 所用的 11.4）。
+    #    从 third_party/flashattention 软链反推 flash-attn 目录，再到其附近的
+    #    env/bin 下找 x86_64-conda-linux-gnu-g++（比硬编码路径更可移植）。
+    here = Path(__file__).resolve().parent
+    fa = os.path.realpath(os.path.join(here, "third_party", "flashattention"))
+    for d in [fa, os.path.dirname(fa),
+              os.path.dirname(os.path.dirname(fa)),
+              os.path.dirname(os.path.dirname(os.path.dirname(fa)))]:
+        cand = os.path.join(d, "env", "bin", "x86_64-conda-linux-gnu-g++")
+        if set_if_ok(cand):
+            return
+    # 4) 系统默认 g++ 恰好落在区间内则直接用
     if ok(ver("g++")):
         return
 
@@ -88,6 +123,14 @@ SRC = Path(__file__).resolve().parent / "csrc" / "my_fa3_kernel.cu"
 BUILD_DIR = Path(__file__).resolve().parent / "build"
 MODULE_NAME = "hopper_fa3_my_kernel"
 
+# CUTLASS (for TMA descriptors, PipelineTmaAsync, GMMA op selectors) and the
+# FA3 hopper headers (softmax.h / utils.h) we reuse for online softmax + WGMMA gemm.
+_HERE = Path(__file__).resolve().parent
+_EXTRA_INCLUDES = [
+    str(_HERE / "third_party" / "cutlass" / "include"),
+    str(_HERE / "third_party" / "flashattention" / "hopper"),
+]
+
 _MY_EXT = None
 _MY_BACKEND = "python_sdpa_fallback"
 _BUILD_TRIED = False
@@ -96,47 +139,50 @@ _BUILD_TRIED = False
 @lru_cache(maxsize=1)
 def _get_extension():
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    # 注意：torch 的 cpp_extension 会自动根据 CXX 环境变量给 nvcc 加 -ccbin，
+    # 所以这里不需要（也不应）再手动加 -ccbin，否则会出现重复/格式错误的参数。
     return load(
         name=MODULE_NAME,
         sources=[str(SRC)],
         extra_cuda_cflags=[
-            "-O3", "-std=c++17", "--use_fast_math",
-            "-allow-unsupported-compiler",
+            "-O3", "-std=c++17", "--use_fast_math", "-DNDEBUG",
+            "-gencode=arch=compute_90a,code=sm_90a",
+            "-allow-unsupported-compiler", "--expt-relaxed-constexpr",
             "-U__CUDA_NO_HALF_OPERATORS__", "-U__CUDA_NO_HALF_CONVERSIONS__",
             "-U__CUDA_NO_BFLOAT16_CONVERSIONS__", "-U__CUDA_NO_HALF2_OPERATORS__",
-        ],
-        extra_cflags=["-O3", "-std=c++17"],
+        ] + [f"-I{p}" for p in _EXTRA_INCLUDES],
+        extra_cflags=["-O3", "-std=c++17", "-DNDEBUG"] + [f"-I{p}" for p in _EXTRA_INCLUDES],
         build_directory=str(BUILD_DIR),
     )
 
 
 def my_kernel(q, k, v, softmax_scale, causal, dummy=False):
-    """调用你的 CUDA 扩展；编译失败则回退到 SDPA。"""
+    """调用你的 CUDA 扩展；正确性跑通前绝不回退 SDPA（会掩盖错误）。编译失败直接抛异常。"""
     global _MY_EXT, _MY_BACKEND, _BUILD_TRIED
     if _MY_EXT is None and not _BUILD_TRIED:
         _BUILD_TRIED = True
-        try:
-            _MY_EXT = _get_extension()
-            _MY_BACKEND = "cuda_pybind_extension"
-        except Exception as e:
-            print(f"[WARN] 你的 CUDA 扩展编译失败，回退 SDPA: {e}")
-            _MY_BACKEND = "python_sdpa_fallback"
-
-    if _MY_EXT is not None:
-        return _MY_EXT.my_fa3_forward(q, k, v, float(softmax_scale), bool(causal))
-    return torch.nn.functional.scaled_dot_product_attention(
-        q, k, v, scale=softmax_scale, is_causal=causal
-    )
+        _MY_EXT = _get_extension()
+        _MY_BACKEND = "cuda_pybind_extension"
+    return _MY_EXT.my_fa3_forward(q, k, v, float(softmax_scale), bool(causal))
 
 
 def official_impl():
     """优先官方 flash-attn (FA3)；Hopper 上 flash_attn_func 自动 dispatch 到 FA3 内核。
-    装不上时回退 torch SDPA。"""
+    装不上时回退 torch SDPA。
+
+    注意: flash_attn_func 期望 (B, N, H, D)，而本框架的 q/k/v 是 (B, H, N, D)。
+    这里把输入 permute 成 (B, N, H, D) 再调用，输出再 permute 回 (B, H, N, D)
+    以便和 my_kernel 的 (B, H, N, D) 输出做正确性对比。
+    """
     try:
         from flash_attn import flash_attn_func
-        return "flash_attn_fa3", lambda q, k, v, s, c: flash_attn_func(
-            q, k, v, dropout_p=0.0, softmax_scale=s, causal=c
-        )
+        def fn(q, k, v, s, c):
+            q_t = q.permute(0, 2, 1, 3).contiguous()
+            k_t = k.permute(0, 2, 1, 3).contiguous()
+            v_t = v.permute(0, 2, 1, 3).contiguous()
+            out = flash_attn_func(q_t, k_t, v_t, dropout_p=0.0, softmax_scale=s, causal=c)
+            return out.permute(0, 2, 1, 3).contiguous()
+        return "flash_attn_fa3", fn
     except Exception:
         pass
     return "torch_sdpa", lambda q, k, v, s, c: (
