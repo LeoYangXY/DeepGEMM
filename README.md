@@ -92,7 +92,6 @@
 | [~~[技术随笔][C++][3W字]📖静态链接和静态库实践指北-原理篇~~](https://zhuanlan.zhihu.com/p/595527528)|@DefTruth|⭐️⭐️⭐️|
 
 | [~~[torch.compile][原理]📖Torch.compile流程解析: 介绍~~](https://zhuanlan.zhihu.com/p/9418379234)|@StarCap|⭐️⭐️⭐️|
-| [[torch.compile][实践]📖Torch.compile详细示例解析教程](https://zhuanlan.zhihu.com/p/855291863)|@Bbuf|⭐️⭐️⭐️|
 | [~~[torch.compile][原理]📖一文搞懂TorchDynamo原理~~](https://zhuanlan.zhihu.com/p/630933479)|@吾乃阿尔法|⭐️⭐️⭐️|
 | [~~[torch.compile][原理]📖理解torch.compile基本原理和使用方式~~](https://zhuanlan.zhihu.com/p/12712224407)|@俯仰|⭐️⭐️⭐️|
 
