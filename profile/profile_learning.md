@@ -5,45 +5,6 @@
 
 ---
 
-## 一、分析方法论
-
-### 1.1 Top-Down 瓶颈分类框架
-
-任何 kernel 的性能问题都可以归入以下分类树：
-
-```
-Kernel 性能不达预期
-├── Compute Bound（计算瓶颈）
-│   ├── Throughput Bound — 某个执行 pipe 饱和（FMA/Tensor/SFU/LSU）
-│   │   └── 可能是指令 mix 不好（太多非计算指令占用了 issue slot）
-│   └── Latency Bound — 指令依赖链太长，ILP 不足
-│       └── 寄存器依赖链、循环展开不够、编译器没有做好指令交错
-│
-├── Memory Bound（内存瓶颈）
-│   ├── Bandwidth Bound — 带宽打满但不够用
-│   │   ├── L1/Shared Memory bandwidth（bank conflict、向量化宽度不够）
-│   │   ├── L2 bandwidth（tile 遍历顺序不好、L2 thrashing）
-│   │   └── HBM/DRAM bandwidth（数据复用率低、tile 太小）
-│   └── Latency Bound — 带宽没打满，在等数据
-│       ├── coalescing 差（global memory 访问不连续，sector 浪费）
-│       ├── cache miss 率高（tiling/数据复用不够）
-│       ├── occupancy 低（warp 不够多，无法隐藏延迟）
-│       └── prefetch/pipeline 不足（没有用异步搬运和计算 overlap）
-│
-├── Sync / Barrier Bound
-│   ├── __syncthreads / mbarrier 等待过久（流水线深度不够）
-│   ├── Atomic contention（多个 warp 竞争同一地址）
-│   └── Cluster barrier / cross-CTA sync 开销
-│
-├── Launch / Tail Bound
-│   ├── Wave quantization（SM 数量不能整除 block 数量，末尾有 idle SM）
-│   ├── Tail effect（问题规模不能整除 tile 大小，边界处理带来分支）
-│   └── Kernel launch overhead（kernel 太小，launch 开销占比高）
-│
-└── Branch / Control Flow Bound
-    ├── Warp divergence（warp 内线程走不同分支，序列化执行）
-    └── Predication overhead（编译器用 predication 替代分支，但浪费了 issue slot）
-```
 
 ### 1.2 核心指标速查表
 
@@ -65,30 +26,6 @@ Kernel 性能不达预期
 | achieved occupancy | `sm__warps_active.avg.pct_of_peak_sustained` | 实际活跃 warp 比例 |
 | eligible warps | `smsp__warps_eligible.avg.per_cycle_active` | 每 cycle 有几个 warp 准备好被调度 |
 
-### 1.3 四步分析流程
-
-```
-Step 1: SOL 面板 → 快速定位大方向
-        compute SOL% 高 → compute bound
-        memory SOL% 高  → memory bound
-        两个都低         → latency bound（最常见！）
-
-Step 2: 确定具体子瓶颈
-        memory bound  → 看哪一层（L1? L2? HBM?）的 throughput 最先打满
-        compute bound → 看哪个 pipe（FMA? Tensor? SFU?）是瓶颈
-        latency bound → 看 warp stall reason 分布，找 top-1 stall 原因
-
-Step 3: 量化差距
-        手算理论上限：kernel 需要搬多少 bytes、做多少 FLOPs
-        对比实际达到的 throughput vs 硬件峰值
-        差距 = 优化空间，针对 root cause 做优化
-        关键：先算再做，估算优化收益，不要盲目试
-
-Step 4: 优化后重新 profile → 回到 Step 1
-        性能分析是迭代过程，每次只改一个变量
-        如果优化后 SOL 分布变了（比如从 memory bound 变成 compute bound），
-        说明瓶颈转移了，需要重新分析
-```
 
 ### 1.4 常见 90% → 100% 的瓶颈及优化方向
 
@@ -110,146 +47,62 @@ Step 4: 优化后重新 profile → 回到 Step 1
 | 末尾 SM 空闲（wave quantization） | block 数不能整除 SM 数 | 调整 grid size 使 block 数是 SM 数的整数倍；或用 stream-k 分解 |
 
 ---
-
-## 二、核心知识点详解
-
-### 2.1 Memory Coalescing（合并访问）
-
-GPU 以 32-byte sector 为单位从 L1 读写 global memory。一个 warp（32 threads）的访问如果能合并到最少的 sector，就是 coalesced。
-
-- **最优**：warp 内连续线程访问连续地址（如 `A[tid]`），每个 sector 被完整利用
-- **最差**：每个线程访问 stride-N 的地址（如 `A[tid * N]`），每个 sector 只取一个元素，浪费带宽
-- **诊断指标**：`l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum` / 理论最少 sector，比值 = 放大倍数
-- **解决**：调整数据布局（AoS → SoA）、用 shared memory 做 transpose
-
-### 2.2 Shared Memory Bank Conflict
-
-Shared memory 被分为 32 个 bank（每个 bank 4 bytes 宽）。同一 warp 内的线程如果访问同一 bank 的不同地址，就会产生 bank conflict，访问被序列化。
-
-- **诊断**：ncu 的 `l1tex__data_bank_conflicts_pipe_lsu_mem_shared.sum`
-- **常见场景**：矩阵转置、GEMM 中 B 矩阵从 SMEM 读取
-- **解决方案**：
-  - **Padding**：每行多加一列 `smem[M][N+1]`，打破 stride 是 32 倍数的对齐
-  - **Swizzle**：用 XOR 函数重排 SMEM 地址（CuTe 的 `Swizzle<B, M, S>` 就是做这个）
-  - **向量化访问**：用 `float4` / `uint4` load，减少访问次数
-
-### 2.3 Occupancy vs ILP 的权衡
-
-- **高 occupancy**：更多 warp 竞争执行，能更好隐藏 latency
-- **高 ILP**：单个 warp 内更多独立指令，也能隐藏 latency
-- **trade-off**：更多 register/SMEM = 更大 tile = 更高 ILP，但 occupancy 降低
-- **关键洞察**：occupancy 不是越高越好。如果 ILP 足够（每个 warp 有足够多的独立指令），低 occupancy 也能打满带宽/算力
-- **经验法则**：GEMM 类 kernel 通常 occupancy 很低（25%-50%）但性能很高，因为大 tile 带来了足够的 ILP 和数据复用
-- **诊断方法**：试着增减 `__launch_bounds__` 的 maxThreadsPerBlock / minBlocksPerMultiprocessor，看性能如何变化
-
-### 2.4 Software Pipelining（多级流水线）
-
-最后 10% 的核心优化手段。目标是让**数据搬运和计算完全 overlap**。
-
-```
-传统写法（无 pipeline）：
-  load tile[0] → sync → compute tile[0] → load tile[1] → sync → compute tile[1] → ...
-  搬运和计算是串行的，GPU 要么在搬数据，要么在计算
-
-Double buffering：
-  load tile[1] → compute tile[0]    （搬运和计算同时进行）
-  load tile[2] → compute tile[1]
-  ...
-
-Triple buffering / N-stage pipeline：
-  更多 stage = 更好的 overlap，但消耗更多 SMEM
-```
-
-- **Hopper+ 用 TMA + mbarrier 实现**：TMA 搬运完成后自动 arrive barrier，SM 不参与搬运
-- **参考实现**：CUTLASS 3.x 的 `MainloopSm80`（cp.async pipeline）和 `MainloopSm90`（TMA pipeline）
-- **诊断**：如果 ncu 显示 warp stall 主因是 `long_scoreboard`（等数据）或 `wait`（等 barrier），说明 pipeline 深度不够
-
-### 2.5 L2 Cache 优化
-
-- **Tile 遍历顺序**：naive 的行优先遍历会导致 L2 thrashing。经典优化：
-  - **Swizzle 遍历**：沿对角线遍历 tile grid，让相邻 block 共享 L2 中的数据
-  - **Hilbert 曲线遍历**：空间局部性最优的遍历顺序
-  - **Stream-K**：把 GEMM 的 K 维度也分给不同 block，提高 L2 复用
-- **L2 persistence**：`cudaAccessPolicyWindow` API 可以把热数据钉在 L2（Ampere+）
-- **诊断**：`lts__t_sector_hit_rate.pct` 太低说明 L2 没被充分利用
-
-### 2.6 Register Spill
-
-当 kernel 使用的寄存器超过硬件限制（每线程最多 255 个 32-bit register），编译器会把一部分溢出到 local memory（实际是 HBM）。
-
-- **诊断**：ncu 中看 `local memory` 流量；`launch__registers_per_thread` 看实际用了多少
-- **影响**：spill 到 HBM 的访问延迟 ~400 cycles，严重拖慢性能
-- **解决**：
-  - `__launch_bounds__(maxThreads, minBlocks)` 提示编译器
-  - `-maxrregcount=N` 编译选项强制限制
-  - 手动减少临时变量，合并循环
-  - 有时接受少量 spill 换取更大 tile 反而更快（需要实测）
-
-### 2.7 向量化访问
-
-GPU 的 load/store 单元支持不同宽度的访问指令：
-
-| 指令 | 宽度 | 对应 C++ 类型 |
-|------|------|---------------|
-| LDG.32 | 4 bytes | `float` |
-| LDG.64 | 8 bytes | `float2` |
-| LDG.128 | 16 bytes | `float4` / `uint4` |
-
-- **LDG.128 vs 4x LDG.32**：同样的数据量，前者只需 1 条指令，后者需要 4 条
-- **意义**：减少指令数量 → 减少 issue slot 占用 → 更多 slot 留给计算指令
-- **实现**：用 `reinterpret_cast<float4*>` 做向量化 load，注意地址必须 16-byte aligned
-- **诊断**：看 SASS 中是否出现了 `LDG.E.128` 还是大量 `LDG.E.32`
-
-### 2.8 Launch Configuration 优化
-
-- **Block size**：通常 128 或 256 threads。太小 = 不够 warp 隐藏延迟；太大 = occupancy 可能受限
-- **Grid size**：确保 block 数量 >= SM 数量 x 2（至少两波）；最好是 SM 数量的整数倍（避免 wave quantization）
-- **Wave quantization**：如果有 108 个 SM，grid 有 109 个 block，最后 1 个 block 独占 1 个 SM，其余 107 个 SM 空闲等待
-- **Persistent kernel**：grid size = SM 数量，每个 block 在循环中处理多个 tile，避免反复 launch
-
-### 2.9 Warp Divergence
-
-一个 warp 的 32 个线程必须执行相同的指令。如果遇到分支：
-- 两个分支都会执行，不走该分支的线程被 mask 掉
-- 性能影响：最坏情况下吞吐减半
-- **诊断**：ncu 的 `smsp__thread_inst_executed_pred_on.avg` / `smsp__thread_inst_executed.avg` < 1.0
-- **优化**：把分支条件和 warp 边界对齐（让整个 warp 走同一分支）
-
-### 2.10 Asynchronous Operations（Hopper+ 重点）
-
-| 机制 | 指令 | 特点 |
-|------|------|------|
-| cp.async (Ampere) | `cp.async.ca.shared.global` | 异步 GMEM→SMEM，但仍需 SM 发起 |
-| cp.async.bulk / TMA (Hopper) | `cp.async.bulk.tensor` | 完全 SM-free 搬运，TMA 硬件独立完成 |
-| mbarrier (Hopper) | `mbarrier.arrive` / `mbarrier.try_wait` | 异步完成通知，替代 __syncthreads |
-| WGMMA (Hopper) | `wgmma.mma_async` | 直接从 SMEM 读 A/B 矩阵做 MMA，省 register |
-| UMMA / tcgen05 (Blackwell) | `tcgen05.mma` | 读 SMEM/TMEM，写 TMEM，新的 Tensor Memory |
-
-- **关键思路**：SM 只负责发指令和等结果，实际搬运和计算由专用硬件（TMA、Tensor Core）完成
-- **诊断**：如果 SM 在等 TMA 完成（warp stall: wait），说明需要更深的 pipeline 或更大的 prefetch 距离
-
-### 2.11 Compiler Flags 对性能的影响
-
-```bash
-# 关键编译选项
-nvcc -arch=sm_90a          # 指定架构（a = 实际架构，不是兼容模式）
-     -O3                   # 最高优化级别
-     --use_fast_math       # 允许快速但精度略低的数学函数
-     -maxrregcount=N       # 限制寄存器数量
-     --ptxas-options=-v    # 显示 register/SMEM 使用量
-     -lineinfo             # 保留行号信息供 ncu Source 页面使用
-
-# 查看编译器生成的 register 和 SMEM 使用量
-ptxas -v your_kernel.ptx
-```
-
-- `-arch=sm_90a` 比 `-arch=sm_90` 能启用更多指令（如 WGMMA、TMA multicast）
-- `--use_fast_math` 可以把 `__sinf` 等替换为 SFU 指令，大幅加速但有精度损失
-- 编译器的指令调度和 register 分配质量有时差强人意，这时需要内联 PTX 或 SASS 级调优
-
 ### 2.12 SASS 级分析
 
+看sass的指令格式，了解固定延迟，long short scoreboard！！！！
+
 SASS = GPU 的真实机器码。最后 5% 的优化经常需要看 SASS。
+
+#### 2.12.1 `smsp__warp_issue_stalled_*` 指标到底输出什么？
+
+**这是最容易误解的点，先讲清楚：**
+
+- 这些指标**不是**「某个特定 warp 因为 XX 而 stall 了」。它是**整个 SM 上所有 warp 的汇总统计**。
+- 它统计的是：**在一个 SM 周期内，某个 warp 因为 XX 原因而无法被发射（issue）** 的 **cycle 数累加**。单位是 **cycle**，不是 warp 个数。
+- 所以 `short_scoreboard = 39.2%` 的意思是：在所有 SM 活跃周期内，平均有 39.2% 的「可发射机会」被 short_scoreboard 这个原因堵住了。
+- **一个 warp 在一个 cycle 可能同时被多个 stall 原因标记**（ncu 会按优先级归因到一个主要原因）。因此**所有 stall 类百分比加起来可以 >100%**，这是正常的，不是 bug。
+- 看这类指标的正确姿势：找 **top-1 stall reason**，而不是看绝对值是否「加起来=100%」。
+
+抓法（Blackwell 上裸 `--metrics` 容易 n/a，用 section 更稳）：
+
+```bash
+# 方法 1：Section（本机 sm_120 最稳）
+ncu --section WarpStateStats --launch-skip 3 --launch-count 1 ./app
+
+# 方法 2：裸指标（若返回 n/a 就退回方法 1）
+ncu --metrics smsp__warp_issue_stalled_long_scoreboard.avg.pct_of_peak_sustained,\
+smsp__warp_issue_stalled_short_scoreboard.avg.pct_of_peak_sustained,\
+smsp__warp_issue_stalled_mio_throttle.avg.pct_of_peak_sustained,\
+smsp__warp_issue_stalled_not_selected.avg.pct_of_peak_sustained \
+--launch-skip 3 --launch-count 1 ./app
+```
+
+#### 2.12.2 Warp Stall 六大类对照表（本机实测验证）
+
+| 你写的名 | ncu 指标名 | 准确吗 | 代表什么 stall | 本机实测 |
+|----------|------------|--------|----------------|----------|
+| `short_scoreboard` | `smsp__warp_issue_stalled_short_scoreboard` | ✅ | 等**短固定延迟结果**就绪：SFU(Tensor Core/MUFU) **和数学结果(FMA)**。⚠️ Blackwell 上**纯 FMA 的等待也被归到这一类** | `fma_chain` 实测 short_sb=**39.2%** 而 long_sb=0% |
+| `long_scoreboard` | `smsp__warp_issue_stalled_long_scoreboard` | ✅ | 等**全局/L2/HBM 加载**回来，可变高延迟 | memory-bound kernel 里 top-1 |
+| `barrier` / `membar` | `..._barrier` / `..._membar` | ✅ | `barrier`=等 `__syncthreads`(执行屏障)；`membar`=等显式内存屏障(`__threadfence`/`MEMBAR.CTA`) | 4 个 kernel 里都是 **0%**（没用同步） |
+| `mio_throttle` | `smsp__warp_issue_stalled_mio_throttle` | ✅ | Shared memory bank conflict（以及 SMEM 其他 MIO 端口争用） | 有 SMEM 冲突的 kernel 里出现 |
+| `not_selected` | `smsp__warp_issue_stalled_not_selected` | ✅ | warp 已就绪(eligible)但 issue slot 抢不到（warp 太多/指令太密） | `mixed_chain` 里高达 **53%** |
+| `wait` | `smsp__warp_issue_stalled_wait` | ✅ | 等 barrier / mbarrier 完成、pipeline 同步（TMA 常见） | TMA pipeline kernel 里出现 |
+
+> 经验法则（直接对应 1.2 速查表）：`long_scoreboard`=等 global memory/L2；`wait`=等 barrier；`mio_throttle`=shared memory bank conflict；`short_scoreboard`=等 L1/SMEM/TC 结果；`not_selected`=warp ready 但 issue slot 不够；`barrier`/`membar`=同步屏障。
+
+#### 2.12.3 还有哪些 ncu 真实存在但常被忽略的 stall 类
+
+上面 6 类是日常 top-1 常客，但 `smsp__warp_issue_stalled_*` 家族里还有这些，看 ncu 表格时会遇到：
+
+- **`tex_throttle`** — 纹理单元吞吐受限（用 surface/texture 时才出现）
+- **`lg_throttle`** — 逻辑/特殊指令（`__popc`、`__brev` 等）的 issue 节流
+- **`no_instruction`** — 该 SM 上没有可发的合法指令（kernel 边界、warp 已退出）
+- **`sleeping`** — warp 因 `nanosleep` / `vote` 等被挂起
+- **`dispatch_stall` / `imc_miss` / `tm_miss`** — 指令缓存/SM 管理类，一般不用管
+
+一句话总结（补进分析流程）：Blackwell/sm_120 的 warp stall 类 = **long_scoreboard**(访存) + **short_scoreboard**(SFU/数学结果) + **barrier/membar**(执行/内存屏障) + **wait**(pipeline 同步) + **mio_throttle**(SMEM bank conflict) + **not_selected**(issue slot 争用)，外加 `tex_throttle`/`lg_throttle`/`no_instruction`/`sleeping` 等次要类。日常分析 top-1 几乎都在前 6 类里。
+
+**关键 SASS 概念：**
 
 ```bash
 # 查看 kernel 的 SASS 汇编
@@ -265,9 +118,6 @@ cuobjdump -sass ./your_app | less
 - **Stall counts**：每条 SASS 指令后的 stall cycle 数字（如 `/* 0x000fc800 */`），表示 issue 前需等待的 cycle
 - **Register bank conflict**：SASS 中如果连续指令的 source operand 在同一 register bank，可能造成 1-cycle penalty
 - **Dual issue**：某些架构支持同 cycle 发射两条指令（如 FMA + 非 FMA），看 SASS 是否做了
-
-
-===========================上面已看========================
 
 ---
 
