@@ -1,8 +1,8 @@
 """FA3 baseline：用同一份输入，对比你的 CUDA kernel 和官方 FA3 / torch SDPA。
 
 用法:
-  python3 run.py                 # 默认 dummy 模式（只跑通流程，不比正确性）
-  python3 run.py --real          # 当你在 csrc 里实现了真 attention，开启正确性对比
+  python3 run.py                 # 默认做真实注意力对比+正确性校验，默认带 causal mask
+  python3 run.py --real          # 关闭 causal mask 跑 non-causal（默认带 causal）
   OFFICIAL=fa3 python3 run.py    # 强制用官方 FA3 作为对比基准
 """
 import argparse
@@ -208,13 +208,14 @@ def main():
     ap.add_argument("--seqlen", type=int, default=2048)
     ap.add_argument("--head-dim", type=int, default=128)
     ap.add_argument("--dtype", default="fp16", choices=["fp16", "bf16", "fp32"])
-    ap.add_argument("--causal", action="store_true")
+    ap.add_argument("--causal", dest="causal", action="store_true", default=True,
+                    help="默认开启 causal mask（用 --no-causal 关闭）")
+    ap.add_argument("--no-causal", dest="causal", action="store_false")
     ap.add_argument("--official", default=os.environ.get("OFFICIAL", "auto"),
                     choices=["auto", "fa3", "sdpa"])
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--iters", type=int, default=50)
-    ap.add_argument("--real", action="store_true",
-                    help="csrc 里已实现真 attention 时，开启正确性对比")
+    # 始终做真实注意力对比 + 正确性校验（不再需要 --real）
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
@@ -252,11 +253,7 @@ def main():
           f"dtype={args.dtype} causal={args.causal}")
     print(f"official_backend={official_name}  |  my_kernel_backend={_MY_BACKEND}")
     print("-" * 72)
-    if args.real:
-        print(f"correctness: {'PASS' if ok else 'FAIL'} | max_abs_diff={max_abs:.6f}")
-    else:
-        print(f"correctness: SKIP (dummy) | max_abs_diff={max_abs:.6f}  "
-              f"(写真 attention 后加 --real 开启对比)")
+    print(f"correctness: {'PASS' if ok else 'FAIL'} | max_abs_diff={max_abs:.6f}")
     print("-" * 72)
     print(f"{official_name:>16} | {ms_off:8.3f} ms | {flops / (ms_off / 1000) / 1e12:8.2f} TFLOPS")
     print(f"{'my_kernel':>16} | {ms_mine:8.3f} ms | {flops / (ms_mine / 1000) / 1e12:8.2f} TFLOPS")
@@ -264,7 +261,7 @@ def main():
     print(f"speedup(my_kernel vs {official_name}) = {ms_off / ms_mine:.3f}x")
     print("=" * 72)
 
-    if args.real and not ok:
+    if not ok:
         raise SystemExit(2)
 
 
