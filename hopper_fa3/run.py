@@ -2,7 +2,7 @@
 
 用法:
   python3 run.py                 # 默认做真实注意力对比+正确性校验，默认带 causal mask
-  python3 run.py --real          # 关闭 causal mask 跑 non-causal（默认带 causal）
+  python3 run.py --no-causal      # 关闭 causal 跑 non-causal（默认带 causal）
   OFFICIAL=fa3 python3 run.py    # 强制用官方 FA3 作为对比基准
 """
 import argparse
@@ -166,22 +166,22 @@ def my_kernel(q, k, v, softmax_scale, causal, dummy=False):
     return _MY_EXT.my_fa3_forward(q, k, v, float(softmax_scale), bool(causal))
 
 
-def official_impl():
-    """优先官方 flash-attn (FA3)；Hopper 上 flash_attn_func 自动 dispatch 到 FA3 内核。
-    装不上时回退 torch SDPA。
-
-    注意: flash_attn_func 期望 (B, N, H, D)，而本框架的 q/k/v 是 (B, H, N, D)。
-    这里把输入 permute 成 (B, N, H, D) 再调用，输出再 permute 回 (B, H, N, D)
-    以便和 my_kernel 的 (B, H, N, D) 输出做正确性对比。
+def official_impl(q, k, v):
+    """优先官方 flash-attn (FA3)。其原生 layout 是 (B,N,H,D)，与 my_kernel 的
+    (B,H,N,D) 不同。为做到 kernel-to-kernel 的【绝对公平】对比：
+      - 输入 q/k/v 在计时循环【之外】预先转置好（一次性数据准备，不计时间）；
+      - 计时循环内只跑 flash_attn_func 本身，连输出转置都不计；
+      - 输出转置只在正确性校验时做一次（同样不计时间）。
+    因此 FA3 的计时 = 纯 kernel 时间，与 my_kernel 对称。
+    装不上时回退 torch SDPA（原生即 (B,H,N,D)，无转置）。
     """
     try:
         from flash_attn import flash_attn_func
-        def fn(q, k, v, s, c):
-            q_t = q.permute(0, 2, 1, 3).contiguous()
-            k_t = k.permute(0, 2, 1, 3).contiguous()
-            v_t = v.permute(0, 2, 1, 3).contiguous()
-            out = flash_attn_func(q_t, k_t, v_t, dropout_p=0.0, softmax_scale=s, causal=c)
-            return out.permute(0, 2, 1, 3).contiguous()
+        qt = q.permute(0, 2, 1, 3).contiguous()
+        kt = k.permute(0, 2, 1, 3).contiguous()
+        vt = v.permute(0, 2, 1, 3).contiguous()
+        def fn(_q, _k, _v, s, c):
+            return flash_attn_func(qt, kt, vt, dropout_p=0.0, softmax_scale=s, causal=c)
         return "flash_attn_fa3", fn
     except Exception:
         pass
@@ -233,13 +233,16 @@ def main():
             torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=s, is_causal=c)
         )
     else:
-        official_name, official_fn = official_impl()
+        official_name, official_fn = official_impl(q, k, v)
 
     out_off = official_fn(q, k, v, scale, args.causal)
+    # 正确性校验：FA3 原生输出是 (B,N,H,D)，转回 (B,H,N,D) 再比；此转置仅用于
+    # 校验，发生在计时循环之外，不影响性能数字。SDPA 原生即 (B,H,N,D) 无需转。
+    out_off_cmp = out_off.permute(0, 2, 1, 3).contiguous() if official_name == "flash_attn_fa3" else out_off
     out_mine = my_kernel(q, k, v, scale, args.causal)
 
-    max_abs = (out_mine - out_off).abs().max().item()
-    ok = torch.allclose(out_mine, out_off, atol=2e-2, rtol=2e-2)
+    max_abs = (out_mine - out_off_cmp).abs().max().item()
+    ok = torch.allclose(out_mine, out_off_cmp, atol=2e-2, rtol=2e-2)
 
     flops = 4.0 * args.batch * args.heads * args.seqlen * args.seqlen * args.head_dim
     if args.causal:
