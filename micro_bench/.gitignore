@@ -1,0 +1,8 @@
+# 编译产物
+m_*
+!m_*.cu
+!m_*.cuh
+*.o
+*.cubin
+*.ptx
+*.ncu-rep
