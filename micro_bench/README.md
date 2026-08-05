@@ -2,6 +2,8 @@
 
 全部数字均为本仓库代码在真机实测所得，非文档抄录。
 
+**怎么读这份文档**：每个小节按“在测什么 → 实测数据 → 一句话结论”组织，数字都是本机真测；标了“概念 / 未实测”的部分（如 C8 的真·TMA、WGMMA）是依据 Hopper 微架构与 CUTLASS 的结论，并非本仓库测量。你无需回头看 kernel 源码。
+
 ## 测试平台
 
 | 项 | 值 |
@@ -47,8 +49,8 @@ SM 时钟 1980 MHz，所以：
 | 文件 | 主题 |
 |---|---|
 | `m_gmem` `m_l2sweep` `m_latency` `m_tlb` | 全局访存 / 缓存层级 / TLB |
-| `m_occ` `m_ilp` `m_issue` `m_ops` `m_div` | 发射、占用率、ILP/TLP、指令代价 |
-| `m_lds` `m_swizzle` `m_cpasync` `m_pipeline` `m_dsmem` | Shared / cp.async / TMA / 集群 |
+| `m_occ` `m_ilp` `m_issue` `m_ops` `m_div` `m_reg` | 发射、占用率、ILP/TLP、指令代价、寄存器压力 |
+| `m_lds` `m_swizzle` `m_cpasync` `m_pipeline` `m_dsmem` `m_l1` | Shared / cp.async / TMA / 集群 / L1切分 |
 | `m_mma` `m_barrier` `m_warpprim` `m_atomic2` | Tensor Core / 同步 / warp 原语 / 原子 |
 | `m_launch` `m_grid` `m_stream` `m_p2p` `m_h2d` `m_clock` | 系统级：启动、波次、并发、多卡、时钟 |
 
@@ -259,9 +261,9 @@ warp 数扫描（每 SM IPC，上限 4 = 4 个 SMSP）：
 |---|---|
 | 手写 `ld.global` + `st.shared` | 2348 GB/s |
 | `cp.async` 16B | 2371 GB/s |
-| **`cp.async.bulk` (TMA)** | **5423 GB/s** |
+| **`cp.async.bulk`（整块拷贝）** | **5423 GB/s** |
 
-> `cp.async` 单看带宽和手写几乎一样（它的价值是**释放寄存器和发射槽**，让计算和搬运真正重叠）。而 **TMA 快 2.3 倍**——因为它是单线程发起的整块描述符拷贝，彻底绕开了 per-thread 的地址计算和发射开销。Hopper 上想吃满带宽，TMA 不是可选项。
+> `cp.async` 单看带宽和手写几乎一样（它的价值是**释放寄存器和发射槽**，让计算和搬运真正重叠）。而 **`cp.async.bulk` 比手写快 2.3 倍**——它是单线程发起的整块拷贝，绕开了 per-thread 地址计算。注意这还**不是真正的 TMA**（真·TMA 描述符路径见 C8）。Hopper 上吃满搬运带宽，cp.async.bulk / TMA 都不可省。
 
 ## C5 `m_pipeline` — cp.async 流水级数
 
@@ -360,6 +362,37 @@ warp 数扫描（每 SM IPC，上限 4 = 4 个 SMSP）：
 > **全局原子的同址冲突是灾难：1.37 Gop/s，比无冲突慢 294 倍。** 而 shared 原子在同址下仍有 147 Gop/s，比全局原子快 **108 倍**。所以直方图/归约的标准范式就是：**先在 shared 里聚合，每 block 只往 global 打一次**。另外 shared 原子在 32 地址后饱和（正好是 32 个 bank）。
 
 ---
+
+## B6 `m_reg` — 寄存器压力与溢出（register spilling）
+
+用 32 条独立 FMA 链强制高寄存器占用，再用 `__launch_bounds__(256, MINB)` 要求至少 MINB 个 block 同驻一 SM：
+
+| MINB | 寄存器/线程 | 溢出 | 本 kernel 吞吐 | 相对 MINB=1 |
+|---|---|---|---|---|
+| 1 | 40 | 0 | 34.5 TFLOP/s | 1.00x |
+| 2 | 40 | 0 | 34.5 | 1.00x |
+| 4 | 40 | 0 | 34.5 | 1.00x |
+| 8 | 32 | 168 B spill | 5.6 TFLOP/s | **0.16x** |
+
+> MINB=8 即 64 warp/SM（H20 满占用），寄存器文件被压到每线程 32 个，低于 kernel 想要的 40 个，**8 个累加器溢出到 local memory（即 HBM）**，吞吐暴跌 6.2 倍。结论反直觉：**盲目拉满占用率会反噬**——寄存器不够时，高占用迫使溢出，比“低占用 + 全寄存器”慢得多。寄存器是 shared 之外第二大占用率限制因素（见 B1）。
+
+## C7 `m_l1` — Hopper L1 / Shared 256KB 可配置切分（opt-in）
+
+每个 SM 的 256KB 在 L1 data cache 与 shared memory 之间分配。默认每块只能用 **48KB** shared，余下 ~208KB 是 L1；通过 `cudaFuncAttributeMaxDynamicSharedMemorySize` opt-in 可把 shared 提到 **227KB**（此时 L1 只剩 ~29KB）。
+
+| opt-in | 32KB | 64KB | 100KB | 164KB | 200KB | 227KB |
+|---|---|---|---|---|---|---|
+| OFF（默认） | OK | FAIL | FAIL | FAIL | FAIL | FAIL |
+| ON | OK | OK | OK | OK | OK | OK |
+
+> Hopper 上 **L1 与 shared 共享同一块 256KB**，并非独立两块。GEMM 想要大 shared tile（如 228KB）必须显式 opt-in，否则只能拿 48KB，直接限制 tile 大小与 occupancy。L1 缩小则 L2 命中率下降——这是“shared 换 L1”的硬权衡。
+
+## C8 真·TMA 描述符拷贝 与 WGMMA 异步 Tensor Core（概念，本仓库未实测）
+
+前面 C4 的 `cp.async.bulk`（5423 GB/s）是普通整块拷贝；Hopper 真正的两张王牌都依赖**描述符**，本机 CUDA 12.1 没有运行时编码 API（`cudaTensorMapEncodeTiled` / WGMMA 描述符），手搓易崩且与版本强相关，故未在此微基准实测，结论以 CUTLASS 3.x 为准：
+
+- **真·TMA（`cp.async.bulk.tensor`）**：用 tensor-map 描述符描述 box 维度与 stride，单线程发起整块拷贝，**支持 multicast（一次写多个 cluster CTA）与 swizzle（按 MMA 需要的布局直接落 shared）**。吞吐与 cp.async.bulk 同量级（~5.4 TB/s），但彻底解放地址计算 / 发射槽，让“搬运”与“计算”真正解耦重叠——这是 Hopper GEMM 的数据路径。
+- **WGMMA（`wgmma.mma_async`）**：warpgroup（4 warp = 128 线程）级**异步** Tensor Core，无需 `__syncthreads` 即可与 TMA、其他 MMA 重叠。原始 TFLOP/s 与 WMMA（D1，~94.7 fp16）基本持平，**真正收益是异步重叠**（compute-compute / compute-copy），需完整 GEMM 流水才能体现——这正是 CUTLASS 3.x `KernelSchedule` 在做的事。
 
 # E. 系统级：启动、波次、并发、多卡
 
@@ -491,6 +524,8 @@ FP32 吞吐全程稳定在 **23.8 TFLOPS**（10.72–10.76 ms/iter，抖动 < 0.
 | 18 | **warp specialization 错开 SMSP** | 同 SMSP 损失 8.8%，跨 SMSP 为 0 |
 | 19 | **NVLink 要攒批** | 4 KB 仅 0.5 GB/s，256 MB 才 391 |
 | 20 | **别为 TLB 优化** | 跨 128 MB 只贵 9.5% |
+| 21 | **Hopper 默认只有 48KB shared** | opt-in 才到 227KB；大 tile GEMM 必须显式 opt-in |
+| 22 | **别盲目拉满占用率** | 寄存器被压溢出时反而慢 6.2x（见 B6） |
 
 ## 关键常数速记（H20）
 
