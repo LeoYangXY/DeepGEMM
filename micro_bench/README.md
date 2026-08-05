@@ -15,6 +15,33 @@
 | 互联 | 2 卡 NV18 NVLink |
 | 编译 | `nvcc -O3 -arch=sm_90` |
 
+## 时间单位换算
+
+SM 时钟 1980 MHz，所以：
+
+```
+1 cycle = 0.505 ns = 5.05e-4 us
+1 us    = 1980 cycles  (记成 ~2000 好算)
+```
+
+| 事件 | cycles | 时间 |
+|---|---|---|
+| FFMA 依赖延迟 | 4.45 | 2.2 ns |
+| `__syncwarp()` | 1-9 | 0.5-4.5 ns |
+| shared 访问 | 29 | 15 ns |
+| `__syncthreads()` (256 thr) | 29 | 15 ns |
+| DSMEM (邻居 block) | ~190 | 96 ns |
+| L2 命中 | 295 | 149 ns |
+| HBM | 335 | 169 ns |
+| `__threadfence()` | 474 | 239 ns |
+| NVLink 远端读 | 1583 | **0.8 us** |
+| kernel launch 地板 | ~3560 | **1.8 us** |
+| launch + sync | ~13760 | **6.9 us** |
+
+> **1 us ≈ 2000 cycles ≈ 6 次 HBM 往返 ≈ 450 条 FFMA 依赖链。** 单次访存只有 0.17 us，所以性能问题从来不是"某一次访存慢"，而是"几万次访存 × 模式很烂"累积出来的。
+>
+> 注意该换算只对 **SM 时钟域**成立（`clock64()` 读的就是它）。显存控制器、NVLink、copy engine 各有独立时钟域，那些地方的 GB/s 不要用 SM 时钟反推 cycle。
+
 ## 快速索引
 
 | 文件 | 主题 |
@@ -495,3 +522,53 @@ nvcc -O3 -arch=sm_90 -o m_xxx m_xxx.cu && ./m_xxx
 2. **ptxas 会把循环不变的 shared load 提出去**：测 shared 必须用 `ld.volatile.shared`，否则 32-way bank conflict 也会显示成 1 cycle。
 3. **测吞吐要打断依赖链，测延迟要构造依赖链**：同一段代码 ILP=1 和 ILP=4 差 3.4 倍，搞错了测出来的是另一个量。
 4. **窄化截断**：`o[tid] = (int)(x0+x1+x2+x3)` 会让编译器发现 64 位高位无用，把 64 位乘法降级成 32 位（i64mul 从 1.9x 的假象变成真实的 7.7x）。必须按原类型写回。
+
+---
+
+# 附录 A：`__threadfence` 与 CUDA 内存模型
+
+`__threadfence()` 是**内存栅栏**，不是同步 barrier —— 最容易混淆的一点。
+
+| | `__syncthreads()` | `__threadfence()` |
+|---|---|---|
+| 语义 | **等所有线程到齐**（执行同步） | **不等任何人**，只约束本线程的写**顺序** |
+| 作用域 | block 内 | 整个 GPU (device scope) |
+| 保证 | 到齐 + 隐含 block 内 fence | 栅栏前的写，对他人一定先于栅栏后的写可见 |
+
+`__threadfence()` 执行完线程立刻继续跑，它只承诺：**别人看到我栅栏后的写时，一定也能看到我栅栏前的写**。
+
+## 三个作用域级别（本仓库 `m_barrier` 实测）
+
+| 级别 | 一致性点 | 64 thr | 1024 thr |
+|---|---|---|---|
+| `__threadfence_block()` | block 内 / L1 | 12 cyc | 120 cyc |
+| `__threadfence()` | 整个 GPU / **L2** | **277 cyc** | **474 cyc** |
+| `__threadfence_system()` | host + peer GPU | 更贵（未测） |
+
+**为什么 device scope 贵 23 倍**：L2 是 GPU 上所有 SM 的一致性点。`__threadfence()` 必须把本线程所有 pending 的写从 L1 / 写合并缓冲**刷到 L2 并等确认**；`__threadfence_block()` 只需刷到 L1/shared 层级。
+
+### 典型用法：device-scope 生产者 / 消费者
+
+```cpp
+// 生产者线程
+data[i] = result;     // 1) 先把数据写好
+__threadfence();      // 2) 保证 data 落到 L2 之后，flag 才可能被别人看到
+flag = 1;             // 3) 再置位“完成”标志
+
+// 消费者线程
+while (flag == 0);    // 自旋等待
+// 读到 flag==1 的瞬间，data[i] 一定已经是最终值（fence 保证了写顺序）
+```
+
+⚠️ 两个坑：
+
+- **它不保证原子性**：多个线程对同一个地址写，照样互相覆盖，`__threadfence()` 管不了竞争，要用 `atomicAdd` / `atomic_ref` 这类原子操作。
+- **它不保证对方“看到”**：fence 只定**顺序**，不负责通知、不负责轮询。别人没看到你的写，纯粹是你没去等 / 没去读，不是 fence 的锅。要做可靠的跨线程信号，得自己配 `flag + 自旋`（如上），或用 `cuda::atomic_ref` 的 acquire/release。
+
+**现代写法**：直接用 `cuda::atomic_ref<T, cuda::thread_scope_device>` 配 `memory_order_release`（生产者）/ `memory_order_acquire`（消费者），把“写顺序”和“读可见”一次性交给原子语义，比手写 `__threadfence() + flag` 安全且不易写错。
+
+### 换算成直觉
+
+一次 `__threadfence()`（device scope，277 cyc）≈ **62 条依赖链 FFMA**（按 4.45 cyc/条）或 277 条独立 FFMA；它比一次 HBM 访问（335 cyc）便宜一点点，但**同量级**——也就是说，一次设备级栅栏的开销已经接近一次远内存访问，能不用就不用，跨 block 通信优先走 shared / cluster DSMEM / `__threadfence_block()`（12~120 cyc）这种便宜得多的层级。
+
+`__threadfence_block()`（12~120 cyc）才是“block 内生产者/消费者”该用的；只有确认真的要和别的 block / 别的 SM 协调全局可见性时，才上 device scope 的 `__threadfence()`。
