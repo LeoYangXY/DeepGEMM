@@ -1,0 +1,21 @@
+# nv24_ordering — NVIDIA H20, 1.980 GHz
+# MP litmus: GPU0 写 data=42 再写 flag=1; GPU1 等 flag 后读 data。
+# data 与 flag 分处不同 128B line。每轮 slot 全清零, 每次迭代用新 slot。
+# SPIN_MAX=2000000 (超时不计入违例, 单独统计)。
+# N=20000 slots/轮, ROUNDS=60 -> 总计 1.20 M 次 MP 观测/组合
+
+================ A) MP litmus —— 四种写侧 x 两种读侧 ================
+写侧 / 读侧                       总迭代    违例数    超时数  写 cyc/it  读 cyc/it
+relaxed st / relaxed ld                 1200000            0            0        13.7       864.7
+relaxed st / acquire ld                 1200000            0            0        13.6       872.3
+fence.sys / relaxed ld                  1200000            0            0      1902.9      1903.7
+fence.sys / acquire ld                  1200000            0            0      1903.3      1903.9
+release.sys / relaxed ld                1200000            0            0      1898.0      1898.8
+release.sys / acquire ld                1200000            0            0      1899.2      1899.9
+volatile / relaxed ld                   1200000            0            0        13.6       864.4
+volatile / acquire ld                   1200000            0            0        13.6       872.3
+
+================ B) store-store 乱序观察 (GPU0 写 A 再写 B, GPU1 见 B 查 A) ================
+总迭代 1200000, 乱序(见B时A未到) 0 次, 超时 0 次, 乱序率 0.000e+00
+
+[done]

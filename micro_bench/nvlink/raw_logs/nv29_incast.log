@@ -1,0 +1,27 @@
+# nv29_incast — NVIDIA H20 x4, 78 SM, 1.980 GHz
+
+================ a/b/c) N 打 1 incast: GPU1..N 同时写 GPU0 ================
+| 源数 | GPU1 | GPU2 | GPU3 | 各流之和 | 墙钟聚合 | vs 单源 | 份额std% |
+|---|---|---|---|---|---|---|---|
+| 1 | 370.5 | - | - | 370.5 | 370.5 | 1.00x | 0.0% |
+| 2 | 188.2 | 188.0 | - | 376.1 | 375.9 | 1.01x | 0.1% |
+| 3 | 125.9 | 125.6 | 125.6 | 377.0 | 376.7 | 1.02x | 0.1% |
+
+判据: 墙钟聚合列若恒定 => 接收端(GPU0)是瓶颈;
+      若随源数下降 => 拥塞崩溃
+
+================ a2) GPU0 接收侧硬件计数器 ================
+1 源打 GPU0      payload=  3221.2 MB | dataTx=     0.0 dataRx=  3221.2 rawTx=  2602.6 rawRx=  3655.9 MB | raw/data=1.943  wire/payload=1.943
+2 源打 GPU0      payload=  6442.5 MB | dataTx=     0.0 dataRx=  6442.5 rawTx=  5231.4 rawRx=  7260.9 MB | raw/data=1.939  wire/payload=1.939
+3 源打 GPU0      payload=  9663.7 MB | dataTx=     0.0 dataRx=  9663.7 rawTx=  7855.9 rawRx= 10887.4 MB | raw/data=1.940  wire/payload=1.940
+(GPU0 的 dataRx 应 = ns * 3221 MB)
+
+================ d) 非对称负载: GPU1 全力打 GPU0, GPU2 用探针测延迟 ================
+| 场景 | 往返延迟 cycles | ns | vs 空闲 |
+|---|---|---|---|
+| GPU2->GPU0 空闲 | 2681 | 1354 | 1.00x |
+| GPU2->GPU0 (GPU1 满载打 GPU0) | 2782 | 1405 | 1.04x |
+
+(探针 = 单线程 st.release.sys + ld.acquire.sys 往返, 2000 次取平均)
+
+[done]

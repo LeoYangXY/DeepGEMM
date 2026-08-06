@@ -1,0 +1,89 @@
+# nv08_outstanding — NVIDIA H20, 78 SM, SM clock 1.980 GHz
+# ITER=512, 每线程每轮发 K 个独立 128-bit 访存 (地址步长 = nthr*16B)
+
+================ A) 单 warp (grid=1, block=32) —— 最纯净的每线程 outstanding ================
+[远端 NVLink GPU0->GPU1]
+--- STORE remote  (grid=1, block=32, 32 thr) ---
+   K       cyc/iter        cyc/req       ns/req       GB/s
+   1           46.2          46.19       23.329      21.95   serializing
+   2           42.2          21.11       10.664      48.01   parallel
+   4           79.4          19.85       10.024      51.08   parallel
+   8          159.3          19.91       10.058      50.90   parallel
+  16          319.3          19.96       10.080      50.80   parallel
+  32          639.3          19.98       10.091      50.74   parallel
+  64         1279.4          19.99       10.096      50.71   parallel
+ 128         2559.3          19.99       10.098      50.70   parallel
+
+--- LOAD  remote  (grid=1, block=32, 32 thr) ---
+   K       cyc/iter        cyc/req       ns/req       GB/s
+   1         1660.4        1660.38      838.573       0.61   serializing
+   2         1667.0         833.49      420.955       1.22   parallel
+   4         1730.7         432.67      218.520       2.34   parallel
+   8         5014.7         626.84      316.585       1.62   parallel
+  16         8321.7         520.11      262.680       1.95   parallel
+  32        14957.6         467.42      236.073       2.17   parallel
+  64        28227.9         441.06      222.758       2.30   parallel
+ 128        54883.4         428.78      216.554       2.36   parallel
+[本地 HBM 对照]
+--- STORE local  (grid=1, block=32, 32 thr) ---
+   K       cyc/iter        cyc/req       ns/req       GB/s
+   1           46.2          46.19       23.329      21.95   serializing
+   2           42.2          21.11       10.664      48.01   parallel
+   4           63.8          15.94        8.052      63.59   parallel
+   8          127.7          15.96        8.062      63.51   parallel
+  16          255.7          15.98        8.072      63.43   parallel
+  32          511.7          15.99        8.077      63.39   parallel
+  64         1023.8          16.00        8.079      63.37   parallel
+ 128         2047.7          16.00        8.080      63.37   parallel
+
+--- LOAD  local  (grid=1, block=32, 32 thr) ---
+   K       cyc/iter        cyc/req       ns/req       GB/s
+   1          315.2         315.20      159.193       3.22   serializing
+   2          323.6         161.81       81.724       6.26   parallel
+   4          381.0          95.25       48.107      10.64   parallel
+   8          980.6         122.57       61.904       8.27   parallel
+  16         1597.1          99.82       50.415      10.16   parallel
+  32         2851.2          89.10       45.000      11.38   parallel
+  64         5355.1          83.67       42.259      12.12   parallel
+ 128        15387.7         120.22       60.716       8.43   parallel
+
+================ B) 单 block 8 warp (grid=1, block=256) —— 有 warp 级并行掩盖时 ================
+
+--- STORE remote  (grid=1, block=256, 256 thr) ---
+   K       cyc/iter        cyc/req       ns/req       GB/s
+   1          159.4         159.40       80.507      50.88   serializing
+   2          319.0         159.48       80.547      50.85   serializing
+   4          638.9         159.73       80.673      50.77   serializing
+   8         1278.3         159.79       80.702      50.75   serializing
+  16         2557.7         159.86       80.736      50.73   serializing
+  32         5117.7         159.93       80.772      50.71   serializing
+  64        10238.4         159.97       80.795      50.70   serializing
+ 128        20477.6         159.98       80.799      50.69   serializing
+
+--- LOAD  remote  (grid=1, block=256, 256 thr) ---
+   K       cyc/iter        cyc/req       ns/req       GB/s
+   1         1664.4        1664.43      840.619       4.87   serializing
+   2         1717.8         858.89      433.781       9.44   parallel
+   4         1780.7         445.18      224.839      18.22   parallel
+   8         5153.6         644.20      325.355      12.59   parallel
+  16         8510.3         531.89      268.633      15.25   parallel
+  32        17715.4         553.61      279.599      14.65   parallel
+  64        34936.5         545.88      275.698      14.86   parallel
+ 128        67908.8         530.54      267.948      15.29   parallel
+
+--- LOAD  local   (grid=1, block=256, 256 thr) ---
+   K       cyc/iter        cyc/req       ns/req       GB/s
+   1          318.1         318.05      160.632      25.50   serializing
+   2          327.8         163.91       82.780      49.48   parallel
+   4          393.6          98.41       49.701      82.41   parallel
+   8          997.1         124.64       62.950      65.07   parallel
+  16         2556.0         159.75       80.681      50.77   parallel
+  32         6725.8         210.18      106.152      38.59   serializing
+  64        14320.5         223.76      113.009      36.25   serializing
+ 128        27861.7         217.67      109.934      37.26   serializing
+
+[说明] cyc/iter 是每轮 K 个请求的耗时。若 K 翻倍 cyc/iter 不变 ->
+       K 个请求完全重叠; 若 cyc/iter 正比于 K -> 槽位打满在排队。
+       'parallel' 标记 = cyc/iter < K*cyc/iter(K=1)*0.6
+
+[done]

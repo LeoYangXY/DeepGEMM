@@ -1,0 +1,47 @@
+# nv33_multicast — NVSwitch 组播 / 在网归约 (NVLink SHARP)
+# NVIDIA H20 x4
+
+================ A) 硬件能力与粒度 ================
+GPU0  MULTICAST_SUPPORTED=1  VMM_SUPPORTED=1
+GPU1  MULTICAST_SUPPORTED=1  VMM_SUPPORTED=1
+GPU2  MULTICAST_SUPPORTED=1  VMM_SUPPORTED=1
+GPU3  MULTICAST_SUPPORTED=1  VMM_SUPPORTED=1
+multicast granularity: minimum=2097152 B (2048 KB), recommended=2097152 B (2 MB)
+multicast object created, size=256 MB, members=4
+VMM allocation granularity = 2097152 B (2048 KB)
+bound + mapped OK
+
+================ B) 正确性: 一次 multimem.st 是否真的写到了所有 4 张卡 ================
+  GPU0 本地内存首 float4 = 1 2 3 4  OK
+  GPU1 本地内存首 float4 = 1 2 3 4  OK
+  GPU2 本地内存首 float4 = 1 2 3 4  OK
+  GPU3 本地内存首 float4 = 1 2 3 4  OK
+
+================ C) 线上字节数: 复制到底发生在哪里 (NVML 每卡 Data 计数器) ================
+multimem.st  由 GPU0 发起, 逻辑 payload = 2147 MB (每卡都应收到这么多)
+  GPU0  wire Tx=    2147 MB  wire Rx=    2147 MB
+  GPU1  wire Tx=       0 MB  wire Rx=    2147 MB
+  GPU2  wire Tx=       0 MB  wire Rx=    2147 MB
+  GPU3  wire Tx=       0 MB  wire Rx=    2147 MB
+unicast 手动广播给 3 个 peer, 逻辑 payload = 2147 MB
+  GPU0  wire Tx=    6442 MB  wire Rx=       0 MB
+  GPU1  wire Tx=       0 MB  wire Rx=    2147 MB
+  GPU2  wire Tx=       0 MB  wire Rx=    2147 MB
+  GPU3  wire Tx=       0 MB  wire Rx=    2147 MB
+
+================ D) 带宽对比 ================
+操作                                         GB/s(逻辑) GB/s(线上)
+unicast 写 1 个 peer                              370.5      370.5
+unicast 广播给 3 个 peer                        120.2      360.6
+multimem.st 组播给 4 张卡                      277.4      277.4
+multimem.ld_reduce 4 卡在网求和                151.8      151.8
+multimem.red 4 卡在网累加(无返回)           277.3      277.3
+
+================ E) multimem.ld_reduce 的线上字节 (在网归约是否真省了流量) ================
+逻辑上读了 2147 MB 的归约结果 (源数据 4 卡各 2147 MB)
+  GPU0  wire Tx=    2147 MB  wire Rx=    2147 MB
+  GPU1  wire Tx=    2147 MB  wire Rx=       0 MB
+  GPU2  wire Tx=    2147 MB  wire Rx=       0 MB
+  GPU3  wire Tx=    2147 MB  wire Rx=       0 MB
+
+[done]

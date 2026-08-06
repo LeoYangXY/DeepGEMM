@@ -1,0 +1,63 @@
+[done] local L1  (32 KB WS)
+[done] local L2  (8 MB WS)
+[done] local L2  (32 MB WS)
+[done] local HBM (512 MB WS)
+[done] remote L1?(32 KB WS)
+[done] remote    (8 MB WS)
+[done] remote    (32 MB WS)
+[done] remote HBM(512 MB WS)
+# nv14_latency — NVIDIA H20 x4, 78 SM, boost clock 1.980 GHz (延迟换算用 1.98 GHz 实测频率)
+
+空循环(依赖链, 无访存) 每次迭代 = 0.00 cyc  -> 已从下表所有数字中扣除
+pointer-chase stride = 8192 B, iters = 4096, <<<1,1>>>
+
+================ A) 每跳延迟 (cycles), 已扣空循环开销 ================
+| level \ modifier       | ld.global (default) | ld.global.ca        | ld.global.cg        | ld.global.cs        | ld.global.lu        | ld.global.cv        | ld.global.nc        | ld.volatile.global  |
+|---|---|---|---|---|---|---|---|---|
+| local L1  (32 KB WS)   |                38.8 |                38.8 |               285.7 |                38.8 |               285.7 |               285.7 |                38.9 |               285.7 |
+| local L2  (8 MB WS)    |                69.2 |                69.2 |               282.0 |                69.2 |               282.0 |               281.9 |                69.4 |               282.0 |
+| local L2  (32 MB WS)   |               282.1 |               282.1 |               282.0 |               274.4 |               282.0 |               282.0 |               282.2 |               282.0 |
+| local HBM (512 MB WS)  |               287.4 |               287.4 |               287.3 |               287.3 |               287.3 |               287.3 |               287.5 |               287.3 |
+| remote L1?(32 KB WS)   |                38.8 |                38.8 |              1580.5 |                38.8 |              1580.8 |              1580.9 |                38.9 |              1580.9 |
+| remote    (8 MB WS)    |               231.8 |               231.8 |              1577.8 |               232.5 |              1583.2 |              1583.2 |               232.6 |              1583.1 |
+| remote    (32 MB WS)   |              1582.9 |              1583.1 |              1583.0 |              1535.0 |              1583.0 |              1583.0 |              1583.2 |              1583.0 |
+| remote HBM(512 MB WS)  |              1589.2 |              1589.1 |              1589.1 |              1589.2 |              1589.1 |              1588.9 |              1589.2 |              1589.1 |
+
+================ B) 每跳延迟 (ns @ 1.98 GHz) ================
+| level \ modifier       | ld.global (default) | ld.global.ca        | ld.global.cg        | ld.global.cs        | ld.global.lu        | ld.global.cv        | ld.global.nc        | ld.volatile.global  |
+|---|---|---|---|---|---|---|---|---|
+| local L1  (32 KB WS)   |                19.6 |                19.6 |               144.3 |                19.6 |               144.3 |               144.3 |                19.6 |               144.3 |
+| local L2  (8 MB WS)    |                35.0 |                35.0 |               142.4 |                35.0 |               142.4 |               142.4 |                35.0 |               142.4 |
+| local L2  (32 MB WS)   |               142.5 |               142.5 |               142.4 |               138.6 |               142.4 |               142.4 |               142.5 |               142.4 |
+| local HBM (512 MB WS)  |               145.2 |               145.2 |               145.1 |               145.1 |               145.1 |               145.1 |               145.2 |               145.1 |
+| remote L1?(32 KB WS)   |                19.6 |                19.6 |               798.2 |                19.6 |               798.4 |               798.5 |                19.6 |               798.4 |
+| remote    (8 MB WS)    |               117.1 |               117.1 |               796.9 |               117.4 |               799.6 |               799.6 |               117.5 |               799.6 |
+| remote    (32 MB WS)   |               799.4 |               799.5 |               799.5 |               775.2 |               799.5 |               799.5 |               799.6 |               799.5 |
+| remote HBM(512 MB WS)  |               802.6 |               802.6 |               802.6 |               802.6 |               802.6 |               802.5 |               802.6 |               802.6 |
+
+================ C) 延迟拆解 (以 ld.global 默认 modifier 为准) ================
+本地 L1 命中                                     38.8 cyc      19.6 ns
+本地 L2 命中                                    282.1 cyc     142.5 ns
+本地 HBM (L2 miss)                                287.4 cyc     145.2 ns
+远端 512MB (NVLink)                              1589.2 cyc     802.6 ns
+远端 32KB (小 WS)                                 38.8 cyc      19.6 ns
+
+分段:
+  L1->L2 增量          =    243.3 cyc (122.9 ns)  = 本地 L2 查询+返回
+  L2->HBM 增量         =      5.3 cyc (2.7 ns)  = 本地 HBM 访问
+  HBM->remote 增量     =   1301.8 cyc (657.5 ns)  = NVLink+NVSwitch 往返净开销
+  remote - L1          =   1550.4 cyc (783.0 ns)  = 整条远端路径(不含 L1 命中部分)
+
+================ D) modifier 相对默认的增量 (cycles, 负=更快) ================
+| level                  | ld.global.ca        | ld.global.cg        | ld.global.cs        | ld.global.lu        | ld.global.cv        | ld.global.nc        | ld.volatile.global  |
+|---|---|---|---|---|---|---|---|
+| local L1  (32 KB WS)   |                 0.0 |               246.9 |                 0.0 |               246.9 |               246.9 |                 0.1 |               246.9 |
+| local L2  (8 MB WS)    |                -0.0 |               212.7 |                -0.0 |               212.7 |               212.7 |                 0.1 |               212.7 |
+| local L2  (32 MB WS)   |                 0.0 |                -0.1 |                -7.7 |                -0.1 |                -0.1 |                 0.1 |                -0.1 |
+| local HBM (512 MB WS)  |                 0.0 |                -0.1 |                -0.1 |                -0.1 |                -0.1 |                 0.0 |                -0.1 |
+| remote L1?(32 KB WS)   |                 0.0 |              1541.7 |                 0.0 |              1542.0 |              1542.2 |                 0.1 |              1542.2 |
+| remote    (8 MB WS)    |                 0.0 |              1346.0 |                 0.7 |              1351.3 |              1351.4 |                 0.8 |              1351.3 |
+| remote    (32 MB WS)   |                 0.2 |                 0.1 |               -47.9 |                 0.1 |                 0.1 |                 0.3 |                 0.1 |
+| remote HBM(512 MB WS)  |                -0.1 |                -0.1 |                 0.1 |                -0.1 |                -0.2 |                 0.0 |                -0.0 |
+
+[done]

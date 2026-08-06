@@ -1,0 +1,39 @@
+nohup: ignoring input
+# nv23_pingpong — NVIDIA H20, SM clock 1.980 GHz
+# <<<1,1>>> spin kernel on GPU0 / GPU1, flag 用 st.release.sys /
+# ld.acquire.sys。SPIN_MAX=200000000 (超时保护)。
+
+================ 0) Smoke test (N=64) —— 先确认不死锁 ================
+flag 都在 GPU0: RTT=11474.4 cyc (5795.1 ns) timeout=0
+
+正式测量 N=20000 次往返
+
+================ A) 纯 flag ping-pong RTT vs flag 放置位置 ================
+flag 放置 (f0 / f1)                               RTT cyc       RTT ns   超时
+f0=GPU0, f1=GPU0 (都在发起方本地)             6251.1       3157.1        0
+f0=GPU1, f1=GPU1 (都在对端)                      6317.5       3190.6        0
+f0=GPU1, f1=GPU0 (各写对端, 各读本地)        5288.7       2671.1        0
+f0=GPU0, f1=GPU1 (各写本地, 各读对端)        6242.6       3152.8        0
+f0=host pinned, f1=host pinned                       8758.6       4423.5        0
+
+[参考] nv20 远端读延迟 ≈ 826 ns, 远端 atom 往返 ≈ 861 ns。
+       一次 ping-pong = 2 个单向跨卡传播 + 2 次自旋检测开销。
+
+================ B) payload 大小 vs 端到端同步往返 (写payload -> 置flag -> 对端读payload -> ack) ================
+payload 在 GPU1 显存 (GPU0 远端写入, GPU1 本地读)
+flag: f0=GPU1(生产者远端写), f1=GPU0(消费者远端写)
+
+   payload B      RTT cyc       RTT ns      增量 ns    等效 GB/s
+           0       7694.9       3886.3            0.0            0.0
+          64       8865.1       4477.3          591.0            0.1
+         256      10758.8       5433.7         1547.4            0.2
+        1024      17460.8       8818.6         4932.3            0.2
+        4096      44630.9      22540.8        18654.5            0.2
+       16384     162995.7      82321.1        78434.7            0.2
+       65536     626249.8     316287.8       312401.4            0.2
+
+[读法] 增量 ns = 相对 payload=0 的额外耗时 = 纯数据传输代价。
+       等效 GB/s = payload / 增量, 反映单线程搬运 payload 的速率
+       (单线程只能发有限个 outstanding 请求, 所以远低于 370 GB/s 峰值)。
+
+[done]

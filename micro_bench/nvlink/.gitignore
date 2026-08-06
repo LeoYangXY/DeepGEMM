@@ -1,0 +1,4 @@
+bin/
+*.o
+*.ncu-rep
+*.nsys-rep

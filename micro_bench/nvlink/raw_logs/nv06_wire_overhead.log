@@ -1,0 +1,48 @@
+# nv06_wire_overhead — 协议开销与 packet 结构 (NVIDIA H20, 78 SM)
+# 理论单向: 18 link * 26.562 GB/s = 478.1 GB/s
+
+================ 原始测量 (每种负载 >= 2s) ================
+  [a_seq_wr] bw=370.2 GB/s rep=2759 payload=740613 MB  dataTx=740613 dataRx=0 rawTx=837550 rawRx=670511 MB
+  [b_seq_rd] bw=369.6 GB/s rep=2755 payload=739540 MB  dataTx=0 dataRx=739540 rawTx=571276 rawRx=832946 MB
+  [c_4B_wr] bw=35.0 GB/s rep=857 payload=70093 MB  dataTx=280372 dataRx=0 rawTx=846209 rawRx=617630 MB
+  [d_4B_rd] bw=35.0 GB/s rep=856 payload=70011 MB  dataTx=0 dataRx=560090 rawTx=667181 rawRx=847044 MB
+  [e_atomicAdd] bw=37.8 GB/s rep=926 payload=75737 MB  dataTx=605892 dataRx=0 rawTx=837812 rawRx=643098 MB
+  [f_memcpyPeer] bw=391.1 GB/s rep=2914 payload=782221 MB  dataTx=782221 dataRx=0 rawTx=832453 rawRx=578801 MB
+
+================ 主表: payload / data / raw / 比值 ================
+| 负载 | 有效BW GB/s | payload MB | dataTx MB | dataRx MB | rawTx MB | rawRx MB | raw/data | wire/payload | rawTx/payload | rawRx/payload |
+|---|---|---|---|---|---|---|---|---|---|---|
+| a_seq_wr | 370.2 | 740613 | 740613 | 0 | 837550 | 670511 | 2.036 | 2.036 | 1.131 | 0.905 |
+| b_seq_rd | 369.6 | 739540 | 0 | 739540 | 571276 | 832946 | 1.899 | 1.899 | 0.772 | 1.126 |
+| c_4B_wr | 35.0 | 70093 | 280372 | 0 | 846209 | 617630 | 5.221 | 20.884 | 12.073 | 8.812 |
+| d_4B_rd | 35.0 | 70011 | 0 | 560090 | 667181 | 847044 | 2.704 | 21.628 | 9.530 | 12.099 |
+| e_atomicAdd | 37.8 | 75737 | 605892 | 0 | 837812 | 643098 | 2.444 | 19.553 | 11.062 | 8.491 |
+| f_memcpyPeer | 391.1 | 782221 | 782221 | 0 | 832453 | 578801 | 1.804 | 1.804 | 1.064 | 0.740 |
+
+================ 反推: packet 头开销 ================
+模型: 每个 packet 携带 D 字节净荷 + H 字节协议开销
+      raw = payload * (D+H)/D  =>  H = D * (raw/payload - 1)
+
+| 负载 | 假设净荷 D | 主方向 raw/payload | 推出 H (B/包) |
+|---|---|---|---|
+| a_seq_wr | 256B | 1.131 | 33.5 |
+| b_seq_rd | 256B | 1.126 | 32.3 |
+| c_4B_wr | 4B | 12.073 | 44.3 |
+| d_4B_rd | 4B | 12.099 | 44.4 |
+| e_atomicAdd | 4B | 11.062 | 40.2 |
+| f_memcpyPeer | 256B | 1.064 | 16.4 |
+
+================ 效率拆解: 为什么只到理论 478 GB/s 的一部分 ================
+| 负载 | 有效BW | 线上BW=有效BW*rawTx/payload | 线上/理论478 | 协议损失 | 其余损失 |
+|---|---|---|---|---|---|
+| a_seq_wr | 370.2 | 753.9 | 157.7% | 50.9% | -57.7% |
+| b_seq_rd | 369.6 | 701.9 | 146.8% | 47.3% | -46.8% |
+| c_4B_wr | 35.0 | 731.1 | 152.9% | 95.2% | -52.9% |
+| d_4B_rd | 35.0 | 756.8 | 158.3% | 95.4% | -58.3% |
+| e_atomicAdd | 37.8 | 739.7 | 154.7% | 94.9% | -54.7% |
+| f_memcpyPeer | 391.1 | 705.6 | 147.6% | 44.6% | -47.6% |
+
+注: 「协议损失」= 线上字节里非净荷的占比; 「其余损失」= 线上带宽
+    仍未打满理论峰值的部分(idle flit / flow-control / switch 调度)。
+
+[done]
