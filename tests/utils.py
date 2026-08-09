@@ -1,3 +1,4 @@
+from __future__ import annotations
 import torch
 
 from deep_gemm.utils import align, get_mk_alignment_for_contiguous_layout

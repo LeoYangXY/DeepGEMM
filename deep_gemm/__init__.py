@@ -82,14 +82,17 @@ except ImportError:
     # Expected behavior for CUDA runtime version before 12.1
     pass
 
-# Mega kernels
-from .mega import (
-    SymmBuffer,
-    get_symm_buffer_for_mega_moe,
-    transform_weights_for_mega_moe,
-    fp8_fp4_mega_moe,
-    bf16_mega_moe,
-)
+# Mega kernels (require torch.distributed._symmetric_memory, newer PyTorch)
+try:
+    from .mega import (
+        SymmBuffer,
+        get_symm_buffer_for_mega_moe,
+        transform_weights_for_mega_moe,
+        fp8_fp4_mega_moe,
+        bf16_mega_moe,
+    )
+except Exception as e:
+    print(f'Failed to load mega kernels, please check your PyTorch version: {e}')
 
 # Some utils
 from . import testing

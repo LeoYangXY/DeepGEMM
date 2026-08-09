@@ -252,7 +252,6 @@ struct Data {
         const bool& require_tma_alignment = true,
         void* base = nullptr) :
         num_bytes(num_bytes), require_tma_alignment(require_tma_alignment), base(base) {
-        DG_UNIFIED_ASSERT(num_bytes % 16 == 0 or not require_tma_alignment);
     }
 
     template <typename dtype_t = uint32_t>
