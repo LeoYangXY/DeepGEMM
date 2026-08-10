@@ -94,6 +94,12 @@ try:
 except Exception as e:
     print(f'Failed to load mega kernels, please check your PyTorch version: {e}')
 
+# Ring AllGather + GEMM 通算融合 kernel（单机多卡，基于 CUDA IPC 对称显存）
+try:
+    from .ring_ag import RingAllGatherGemm
+except Exception as e:
+    print(f'Failed to load ring all-gather GEMM: {e}')
+
 # Some utils
 from . import testing
 from . import utils
