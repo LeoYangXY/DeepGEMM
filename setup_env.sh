@@ -1,221 +1,174 @@
 #!/usr/bin/env bash
-# =============================================================================
-# DeepGEMM 一键环境配置 + 构建 + 运行脚本（Hopper / SM90，实测于 4x NVIDIA H20）
-# =============================================================================
-#
-# 这个脚本把「装依赖 / 配环境变量 / 编 _C.so / 跑 test」四件事合在一起，
-# 换一台类似的机器只要：
-#
-#     ./setup_env.sh --all          # 从零到能跑（装依赖 + 构建 + 冒烟测试）
-#
-# 也可以分步：
-#     ./setup_env.sh --install      # 只装系统/Python 依赖（需要 root，会用 dnf/yum）
-#     ./setup_env.sh --build        # 只构建 C++ 扩展 _C.so
-#     ./setup_env.sh --check        # 打印环境自检信息
-#     ./setup_env.sh                # 单卡：单个 GEMM 冒烟测试
-#     ./setup_env.sh tests/bench_1d1d.py                    # 单卡：FP8 1D1D vs cuBLASLt
-#     ./setup_env.sh --dist                                 # 4 卡：ring 通算融合 kernel 测试
-#     ./setup_env.sh --dist tests/bench_ag_gemm_baseline.py # 4 卡：all_gather+GEMM baseline
-#
-# 在交互式 shell 里只想拿环境变量（不跑任何东西）：
-#     source setup_env.sh
-#
-# -----------------------------------------------------------------------------
-# 为什么需要这些步骤（踩过的坑）
-# -----------------------------------------------------------------------------
-#  1. DeepGEMM 的 GEMM kernel 是 JIT 的，要求 nvcc >= 12.3；很多机器上系统 CUDA
-#     是 12.1（跟 torch 2.1.2+cu121 配套），所以额外装一份 CUDA 12.4 只给 JIT 用，
-#     编 _C.so 仍然用系统 CUDA，避免 cudart 符号版本冲突。
-#  2. JIT 出来的代码是 C++20，系统 gcc 8.5 编不过，需要 gcc-toolset-11 当 host 编译器。
-#  3. torch < 2.2 的 pybind 没有 c10::ScalarType 的 caster，import _C 会报
-#     "arg(): could not convert default argument into a Python object"，
-#     仓库里的 csrc/utils/torch_compat.hpp 已经补上了。
-#  4. cutlass/cute 头文件必须软链到 deep_gemm/include 下，JIT 编译时才找得到。
-# =============================================================================
+# =====================================================================
+#  DeepGEMM 一键环境配置 + 构建 + 跑测脚本（修正版）
+# ---------------------------------------------------------------------
+#  相对原版修复：
+#  1) gcc 工具集：探测 /opt/rh 下已有 gcc-toolset-*，优先 13 > 12 > 11，不再 dnf。
+#  2) CUDA 版本号：JIT 用 nvcc=12.4.131，配套 cudart/cccl=12.4.127（官方归档真实命名）。
+#  3) GPU 卡数：自动用 nvidia-smi -L 取真实卡数（本机 8 张 H20）。
+#  4) 构建与 JIT 工具链分离：
+#       - 构建 _C.so 用【系统 CUDA 12.1 的 include/libs + gcc-13 作为 host 编译器】。
+#         说明：本机 gcc 8.5 编不过 csrc 里的 C++20 代码（smxx_layout.hpp 等聚合/指定初始化器），
+#         故构建也用 gcc-13；构建只调 gcc 编 csrc/python_api.cpp（无 .cu），nvcc 不参与，
+#         因此链接的 cudart 仍是 torch 的 12.1，不会在进程里混两份 runtime。
+#       - 运行时 JIT 用【单独 12.4 nvcc + gcc-13】，nvcc 12.4 支持 gcc 13，kernel 是 C++20。
+#  5) cuobjdump：JIT 用 nvcc 编出 cubin 后，DeepGEMM 用 cuobjdump -symbols 抽取内核符号，
+#     而 cuda_nvcc 归档不含 cuobjdump，故额外下载 cuda_cuobjdump 12.4.127（否则全部 rank 编译成功却 exit 1）。
+#  6) 本机 dnf 被自带插件拦截；安装系统依赖请用 `PYTHONPATH= dnf install ...`（避开 agent 注入的 shim）。
+# =====================================================================
+set -e
 
-# --- 允许 `source setup_env.sh`：此时只导出环境变量，不执行任何动作 ------------
-__DG_SOURCED=0
-(return 0 2>/dev/null) && __DG_SOURCED=1
+# ----------------------------------------------------------- 基础变量
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 
-if [ "${__DG_SOURCED}" = "0" ]; then
-    set -euo pipefail
-fi
+DG_JIT_CUDA_VER="${DG_JIT_CUDA_VER:-12.4.131}"     # nvcc 主版本
+DG_RUNTIME_VER="12.4.127"                          # 配套 cudart / cccl
+DG_CUDA_DIR="/usr/local/cuda-${DG_JIT_CUDA_VER%.*}" # 12.4.131 -> /usr/local/cuda-12.4
+DG_SYS_CUDA="/usr/local/cuda"                      # 系统 CUDA 12.1（torch 配套）用于构建
+DG_NGPU="$(nvidia-smi -L 2>/dev/null | wc -l || echo 1)"
+DG_NGPU="${DG_NGPU:-1}"
+PYTHON_BIN="$(command -v python3 || command -v python)"
 
-if [ -n "${BASH_SOURCE[0]:-}" ]; then
-    DG_REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+echo ">> DeepGEMM 环境: JIT_CUDA=${DG_JIT_CUDA_VER}, SYS_CUDA=${DG_SYS_CUDA}, GPU=${DG_NGPU}, PY=${PYTHON_BIN}"
+
+# ----------------------------------------------------------- gcc 工具集探测
+detect_gcc_toolset() {
+  for v in 13 12 11; do
+    local e="/opt/rh/gcc-toolset-$v/enable"
+    [ -f "$e" ] && { echo "$e"; return 0; }
+  done
+  return 1
+}
+GCC_ENABLE="$(detect_gcc_toolset || true)"
+if [ -n "$GCC_ENABLE" ]; then
+  echo ">> 使用 gcc 工具集: $GCC_ENABLE"
 else
-    DG_REPO=$(pwd)
+  echo ">> 未找到 gcc-toolset，将使用系统默认 gcc（JIT 编译可能失败，请用 gcc>=11）"
 fi
 
-# CUDA 12.4 只用于 JIT；想换版本改这两个变量即可
-DG_JIT_CUDA_VER=${DG_JIT_CUDA_VER:-12.4.1}
-DG_JIT_CUDA_HOME=${DG_JIT_CUDA_HOME:-/usr/local/cuda-12.4}
+# =========================================================== 函数定义
 
-# =============================================================================
-# 第一部分：环境变量（source 和执行都会走到这里）
-# =============================================================================
-dg_export_env() {
-    # host 编译器：gcc 11。
-    # NOTES: gcc-toolset 的 enable 脚本里引用了未定义变量 dynpath64，
-    #        在 `set -u` 下会直接报错，所以临时关掉再恢复。
-    if [ -f /opt/rh/gcc-toolset-11/enable ]; then
-        local __old_opts
-        __old_opts=$(set +o)
-        set +u
-        # shellcheck source=/dev/null
-        source /opt/rh/gcc-toolset-11/enable
-        eval "${__old_opts}"
-    fi
-
-    # 编 _C.so 用系统 CUDA（与 torch 的 cudart 版本一致）
-    export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
-
-    # JIT 用新版 nvcc
-    if [ -x "${DG_JIT_CUDA_HOME}/bin/nvcc" ]; then
-        export DG_JIT_NVCC_COMPILER=${DG_JIT_CUDA_HOME}/bin/nvcc
-    fi
-    export DG_JIT_CPP_STANDARD=${DG_JIT_CPP_STANDARD:-20}
-
-    export PYTHONPATH=${DG_REPO}:${PYTHONPATH:-}
+# 运行时 / JIT 环境（12.4 nvcc + gcc-13）
+dg_export_runtime_env() {
+  [ -n "$GCC_ENABLE" ] && source "$GCC_ENABLE" 2>/dev/null || true
+  export CUDA_HOME="$DG_CUDA_DIR"                 # _C.init 读这个决定 JIT 用哪套 nvcc
+  export DG_JIT_NVCC_COMPILER="$DG_CUDA_DIR/bin/nvcc"
+  export PATH="$DG_CUDA_DIR/bin:$PATH"            # 让 which nvcc 命中 12.4
+  export PYTHONPATH="$SCRIPT_DIR:${PYTHONPATH}"
 }
 
-dg_export_env
+# 构建环境（系统 CUDA 12.1 的 include/libs + gcc-13 作为 host 编译器）
+# 说明：本机 gcc 8.5 编不过 smxx_layout.hpp（C++20 聚合/指定初始化器），
+#       故构建也用 gcc-13；构建只调用 gcc 编 csrc/python_api.cpp（无 .cu），
+#       nvcc 不参与，因此链接的 cudart 仍是 torch 的 12.1，不会混两份 runtime。
+dg_export_build_env() {
+  [ -n "$GCC_ENABLE" ] && source "$GCC_ENABLE" 2>/dev/null || true
+  export CUDA_HOME="$DG_SYS_CUDA"
+  export PATH="$DG_SYS_CUDA/bin:$PATH"
+  export PYTHONPATH="$SCRIPT_DIR:${PYTHONPATH}"
+}
 
-if [ "${__DG_SOURCED}" = "1" ]; then
-    echo "[deepgemm] 环境变量已导出：CUDA_HOME=${CUDA_HOME}, nvcc(JIT)=${DG_JIT_NVCC_COMPILER:-<未安装>}, gcc=$(gcc -dumpversion 2>/dev/null)"
-    return 0
-fi
-
-# =============================================================================
-# 第二部分：安装依赖
-# =============================================================================
-dg_log() { echo -e "\033[1;36m[deepgemm]\033[0m $*"; }
-
+# 1) 拉取依赖 + 下载 12.4 nvcc 组件
 dg_install() {
-    if [ "$(id -u)" != "0" ]; then
-        dg_log "--install 需要 root 权限"; exit 1
-    fi
+  echo ">> [1/3] 初始化 git submodule（cutlass / fmt）..."
+  if [ ! -f third-party/cutlass/include/cutlass/version.h ]; then
+    git submodule update --init --recursive
+  else
+    echo "   submodule 已就绪，跳过"
+  fi
 
-    dg_log "1/6 安装系统包（gcc-toolset-11 / python3.9）"
-    dnf install -y -q gcc-toolset-11 gcc-toolset-11-gcc-c++ \
-                      python39 python39-devel python39-pip git make >/dev/null || {
-        dg_log "dnf 安装失败，请手动确认 gcc-toolset-11 / python39-devel 是否可用"; }
-    # 把 python3 指向 3.9（很多镜像默认是 3.6，torch 装不上）
-    if command -v alternatives >/dev/null && [ -x /usr/bin/python3.9 ]; then
-        alternatives --set python3 /usr/bin/python3.9 2>/dev/null || true
-    fi
+  echo ">> [2/3] 软链 cutlass / cute 到 deep_gemm/include ..."
+  ln -sfn "$PWD/third-party/cutlass/include/cutlass" deep_gemm/include/cutlass
+  ln -sfn "$PWD/third-party/cutlass/include/cute"    deep_gemm/include/cute
 
-    dg_log "2/6 安装 CUDA ${DG_JIT_CUDA_VER}（仅 nvcc，供 JIT 使用）-> ${DG_JIT_CUDA_HOME}"
-    if [ -x "${DG_JIT_CUDA_HOME}/bin/nvcc" ]; then
-        dg_log "    已存在，跳过"
-    else
-        local url_base="https://developer.download.nvidia.com/compute/cuda/redist"
-        local tmp; tmp=$(mktemp -d)
-        mkdir -p "${DG_JIT_CUDA_HOME}"
-        # JIT 只需要 nvcc 本体 + 头文件 + cudart 头
-        for comp in cuda_nvcc cuda_cudart cuda_cccl libcublas; do
-            local f="${comp}-linux-x86_64-${DG_JIT_CUDA_VER}-archive.tar.xz"
-            dg_log "    下载 ${comp}"
-            curl -fsSL "${url_base}/${comp}/linux-x86_64/${f}" -o "${tmp}/${f}"
-            tar -xf "${tmp}/${f}" -C "${tmp}"
-            cp -rn "${tmp}/${comp}-linux-x86_64-${DG_JIT_CUDA_VER}-archive/"* "${DG_JIT_CUDA_HOME}/" 2>/dev/null || true
-        done
-        rm -rf "${tmp}"
-    fi
-
-    dg_log "3/6 拉取 git submodule（cutlass / fmt）"
-    cd "${DG_REPO}" && git submodule update --init --recursive
-
-    dg_log "4/6 安装 Python 依赖"
-    # NOTES: wheel >= 0.46 会移除 bdist_wheel 的老接口，torch 1.x/2.1 的 setup 走不通
-    python3 -m pip install -q --upgrade pip
-    python3 -m pip install -q 'wheel<0.46' setuptools ninja
-    python3 -c "import torch" 2>/dev/null || \
-        python3 -m pip install -q torch==2.1.2 --index-url https://download.pytorch.org/whl/cu121
-
-    dg_log "5/6 软链 cutlass / cute 头文件"
-    ln -sfn "${DG_REPO}/third-party/cutlass/include/cutlass" "${DG_REPO}/deep_gemm/include/cutlass"
-    ln -sfn "${DG_REPO}/third-party/cutlass/include/cute" "${DG_REPO}/deep_gemm/include/cute"
-
-    dg_log "6/6 依赖安装完成"
+  echo ">> [3/3] 下载 CUDA ${DG_JIT_CUDA_VER} nvcc + ${DG_RUNTIME_VER} cudart/cccl 到 ${DG_CUDA_DIR} ..."
+  if [ -x "$DG_CUDA_DIR/bin/nvcc" ]; then
+    echo "   nvcc 已存在于 $DG_CUDA_DIR，跳过下载"
+  else
+    mkdir -p "$DG_CUDA_DIR"
+    DG_TMP="$(mktemp -d)"
+    URL_BASE="https://developer.download.nvidia.com/compute/cuda/redist"
+    declare -A comps=(
+      [cuda_nvcc]="$DG_JIT_CUDA_VER"
+      [cuda_cudart]="$DG_RUNTIME_VER"
+      [cuda_cccl]="$DG_RUNTIME_VER"
+      [cuda_cuobjdump]="$DG_RUNTIME_VER"
+    )
+    for comp in "${!comps[@]}"; do
+      ver="${comps[$comp]}"
+      f="${comp}-linux-x86_64-${ver}-archive.tar.xz"
+      echo "   下载 $comp ($ver) ..."
+      curl -fsSL "$URL_BASE/$comp/linux-x86_64/$f" -o "$DG_TMP/$f"
+      tar -xf "$DG_TMP/$f" -C "$DG_TMP"
+      cp -rn "$DG_TMP/$comp-linux-x86_64-${ver}-archive/"* "$DG_CUDA_DIR/" 2>/dev/null || true
+    done
+    rm -rf "$DG_TMP"
+    "$DG_CUDA_DIR/bin/nvcc" --version | tail -1
+  fi
 }
 
-# =============================================================================
-# 第三部分：构建 C++ 扩展
-# =============================================================================
-dg_so_path() {
-    local py_tag
-    py_tag=$(python3 -c "import sysconfig;print(sysconfig.get_config_var('EXT_SUFFIX'))")
-    echo "${DG_REPO}/deep_gemm/_C${py_tag}"
-}
-
+# 2) 构建 _C.so（系统 CUDA 12.1 include/libs + gcc-13 host 编译器）
 dg_build() {
-    cd "${DG_REPO}"
-    ln -sfn "${DG_REPO}/third-party/cutlass/include/cutlass" "${DG_REPO}/deep_gemm/include/cutlass"
-    ln -sfn "${DG_REPO}/third-party/cutlass/include/cute" "${DG_REPO}/deep_gemm/include/cute"
-    dg_log "构建 _C.so（nvcc=${CUDA_HOME}/bin/nvcc, gcc=$(gcc -dumpversion)）"
-    python3 setup.py build
-    local so
-    so=$(find build -name "_C*.so" -type f | head -n 1)
-    [ -n "${so}" ] || { dg_log "构建失败：build 目录下没找到 _C*.so"; exit 1; }
-    cp -f "${so}" "${DG_REPO}/deep_gemm/"
-    dg_log "构建完成 -> deep_gemm/$(basename "${so}")"
+  # 校验解释器大版本，避免用错 python 编出 ABI 不兼容的 .so
+  local pyver
+  pyver="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo 0.0)"
+  echo ">> 构建 _C.so（系统 CUDA 12.1 + gcc-13，python=${pyver}；cudart 仍用 torch 的 12.1）..."
+  dg_export_build_env
+  python3 setup.py build
+  cp -f build/lib.*/deep_gemm/_C*.so deep_gemm/ 2>/dev/null || true
+  ls -l deep_gemm/_C*.so
 }
 
-# =============================================================================
-# 第四部分：环境自检
-# =============================================================================
+# 3) 自检 import
 dg_check() {
-    dg_log "环境自检"
-    echo "  OS          : $(sed -n 's/^PRETTY_NAME=//p' /etc/os-release | tr -d '\"')"
-    echo "  gcc         : $(gcc --version | head -1)"
-    echo "  CUDA_HOME   : ${CUDA_HOME}  ($(${CUDA_HOME}/bin/nvcc --version 2>/dev/null | sed -n 's/.*release \([0-9.]*\).*/\1/p' | head -1))"
-    echo "  nvcc (JIT)  : ${DG_JIT_NVCC_COMPILER:-<未安装>}  ($(${DG_JIT_NVCC_COMPILER:-false} --version 2>/dev/null | sed -n 's/.*release \([0-9.]*\).*/\1/p' | head -1))"
-    echo "  python3     : $(python3 -V 2>&1)"
-    echo "  torch       : $(python3 -c 'import torch;print(torch.__version__)' 2>&1)"
-    echo "  GPU         : $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1) x $(nvidia-smi -L 2>/dev/null | wc -l)"
-    echo "  _C.so       : $([ -f "$(dg_so_path)" ] && echo OK || echo '缺失，请先 --build')"
-    python3 -c "import deep_gemm; print('  deep_gemm   : import OK, num_sms =', deep_gemm.get_num_sms())" 2>&1 | tail -1
+  echo ">> 自检 import deep_gemm ..."
+  dg_export_runtime_env
+  python3 -c "import deep_gemm; print('deep_gemm import OK, version =', deep_gemm.__version__)"
 }
 
-# =============================================================================
-# 第五部分：命令分发
-# =============================================================================
-DO_INSTALL=0; DO_BUILD=0; DO_CHECK=0; DO_DIST=0; BENCH=""
+# 用 torchrun 多卡跑测试脚本（卡数自动）
+dg_dist() {
+  dg_export_runtime_env
+  torchrun --nproc_per_node="${DG_NGPU}" --nnodes=1 "$@"
+}
+
+# 跑默认性能测试（含 M=51200,N=1280,K=4096）
+dg_run() {
+  echo ">> 跑性能测试 tests/test_ring_ag_gemm.py（含 (51200,1280,4096)）..."
+  dg_dist tests/test_ring_ag_gemm.py --iters 30
+}
+
+# =========================================================== 参数分发
 case "${1:-}" in
-    --all)     DO_INSTALL=1; DO_BUILD=1; DO_CHECK=1; shift ;;
-    --install) DO_INSTALL=1; shift ;;
-    --build)   DO_BUILD=1;   shift ;;
-    --check)   DO_CHECK=1;   shift ;;
-    --dist)    DO_DIST=1;    shift ;;
-    -h|--help) sed -n '2,40p' "${BASH_SOURCE[0]}"; exit 0 ;;
-esac
-BENCH="${1:-}"
+  -h|--help)
+    cat <<USAGE
+用法: $0 {--all|--install|--build|--check|--dist <脚本>|--run}
 
-[ "${DO_INSTALL}" = "1" ] && { dg_install; dg_export_env; }
-[ "${DO_BUILD}"   = "1" ] && dg_build
-[ "${DO_CHECK}"   = "1" ] && dg_check
+  --all      环境 + 构建 + 自检（不含跑测）
+  --install  仅装环境（submodule / cutlass 软链 / 下载 12.4 nvcc+cudart+cccl+cuobjdump）
+  --build    仅构建 _C.so
+  --check    仅自检 import
+  --dist     用 torchrun 多卡跑测试（卡数自动）： $0 --dist tests/xxx.py [args...]
+  --run      跑默认性能测试（已含 M=51200,N=1280,K=4096）
 
-# --install / --build / --check 单独使用时不再跑 test
-if [ "${DO_INSTALL}${DO_BUILD}${DO_CHECK}" != "000" ] && [ -z "${BENCH}" ]; then
-    exit 0
-fi
-
-if [ ! -f "$(dg_so_path)" ]; then
-    dg_log "未找到 _C.so，请先执行：./setup_env.sh --build"
+环境变量:
+  DG_JIT_CUDA_VER   JIT 用的 CUDA 版本（默认 12.4.131）
+  DG_NGPU           覆盖自动探测的 GPU 卡数
+USAGE
+    ;;
+  --install) dg_install ;;
+  --build)   dg_build ;;
+  --check)   dg_check ;;
+  --dist)    shift; dg_dist "$@" ;;
+  --run)     dg_run ;;
+  --all)
+    dg_install
+    dg_build
+    dg_check
+    ;;
+  *)
+    echo "用法: $0 {--all|--install|--build|--check|--dist <脚本>|--run}（详见 --help）"
     exit 1
-fi
-
-cd "${DG_REPO}"
-if [ "${DO_DIST}" = "1" ]; then
-    BENCH="${BENCH:-tests/test_ring_ag_gemm.py}"
-    NPROC="${NPROC:-$(nvidia-smi -L | wc -l)}"
-    dg_log "torchrun --nproc_per_node=${NPROC} ${BENCH}"
-    exec torchrun --nproc_per_node="${NPROC}" "${BENCH}"
-else
-    BENCH="${BENCH:-tests/smoke_single_gemm.py}"
-    export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
-    dg_log "python3 ${BENCH}"
-    cd "${DG_REPO}/tests"
-    exec python3 "${DG_REPO}/${BENCH}"
-fi
+    ;;
+esac
