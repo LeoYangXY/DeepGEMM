@@ -174,6 +174,7 @@ __device__ __forceinline__ void load_b_fragment_ldsm_x2n(
 //              LDSM B[n2+1]       // overlap with 2x QMMA of n2
 //              QMMA n2*2
 //              QMMA n2*2+1
+//  SASS walk-through: docs/sm120_fp8_sass_hand_schedule.md.
 //
 //  BLOCK_N is a multiple of 16 (heuristics).  Accumulators stay in RF and
 //  are only written by QMMA, so the two n8 MMAs of one x4 B-load are
