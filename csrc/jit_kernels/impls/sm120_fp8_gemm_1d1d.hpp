@@ -51,7 +51,8 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {},
-        {}, {}
+        {}, {},
+        {}
     >);
 }};
 )",
@@ -65,7 +66,8 @@ static void __instantiate_kernel() {{
         args.gemm_config.launch_config.num_tma_threads, args.gemm_config.launch_config.num_math_threads,
         /*kNumTMAMulticast=*/1, /*kIsTMAMulticastOnA=*/false,
         args.gemm_config.launch_config.num_sms, to_string(args.gemm_desc.gemm_type),
-        to_string(args.gemm_desc.cd_dtype));
+        to_string(args.gemm_desc.cd_dtype),
+        args.gemm_config.launch_config.min_blocks_per_sm > 0 ? args.gemm_config.launch_config.min_blocks_per_sm : 1);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {

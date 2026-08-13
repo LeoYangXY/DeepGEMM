@@ -39,7 +39,7 @@ static GemmConfig get_best_config(const GemmDesc& desc) {
     // Print configs for the first time
     if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {
         std::stringstream ss;
-        ss << desc;
+        ss << desc << " | " << gemm_config.layout;
         const auto key = ss.str();
 
         static std::unordered_set<std::string> printed;

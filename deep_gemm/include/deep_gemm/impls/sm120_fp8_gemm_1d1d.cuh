@@ -60,8 +60,9 @@ template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
           uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
           uint32_t kNumSMs,
-          GemmType kGemmType, typename cd_dtype_t>
-CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
+          GemmType kGemmType, typename cd_dtype_t,
+          uint32_t kMinBlocksPerSM>
+CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, kMinBlocksPerSM) void
 sm120_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
                         int* grouped_layout,
                         cute::TmaDescriptor* tensor_map_buffer,
@@ -71,7 +72,7 @@ sm120_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_cd) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900)) or defined(__CLION_IDE__)
     // -------- Compile-time checks --------
-    DG_STATIC_ASSERT(kNumTMAThreads == 128 and kNumMathThreads % 128 == 0, "Invalid Threads");
+    DG_STATIC_ASSERT((kNumTMAThreads == 32 or kNumTMAThreads == 128) and kNumMathThreads % 128 == 0, "Invalid Threads");
     DG_STATIC_ASSERT(kGemmType == GemmType::Normal or kGemmType == GemmType::KGroupedContiguous, "Invalid GEMM type");
     DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, float>, "Invalid C/D data dtype");
     DG_STATIC_ASSERT(kNumTMAMulticast == 1, "SM120 kernel does not support TMA multicast / cluster");
@@ -91,20 +92,14 @@ sm120_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
 
     // -------- Shared-memory layout --------
     static constexpr uint32_t SMEM_TENSOR_MAP_SIZE = (kGemmType == GemmType::KGroupedContiguous ? sizeof(cute::TmaDescriptor) * 2 : 0);
-    static constexpr uint32_t SMEM_D_SIZE = BLOCK_M * BLOCK_N * sizeof(float);
+    // TMA CD box is 64 x BLOCK_N (store_block_m). Two math WGs share this
+    // buffer and serialize stores when BLOCK_M == 128.
+    static constexpr uint32_t SMEM_D_SIZE = MMA::M * BLOCK_N * sizeof(float);
     static constexpr uint32_t SMEM_A_SIZE_PER_STAGE = BLOCK_M * BLOCK_K * sizeof(__nv_fp8_e4m3);
     static constexpr uint32_t SMEM_B_SIZE_PER_STAGE = BLOCK_N * BLOCK_K * sizeof(__nv_fp8_e4m3);
 
     const uint32_t warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
     const uint32_t lane_idx = threadIdx.x % 32;
-
-    // Prefetch TMA descriptors
-    if (warp_idx == kNumMathThreads / 32 and cute::elect_one_sync()) {
-        cute::prefetch_tma_descriptor(&tensor_map_a_base);
-        cute::prefetch_tma_descriptor(&tensor_map_b_base);
-        cute::prefetch_tma_descriptor(&tensor_map_cd);
-    }
-    __syncwarp();
 
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
     DG_STATIC_ASSERT(SMEM_D_SIZE % 1024 == 0, "Shared memory of A/B must be aligned to 1024 bytes");
@@ -130,7 +125,10 @@ sm120_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
         return reinterpret_cast<Barrier*>(smem_buffer + (SMEM_BARRIER_OFFSET + (kNumStages + i) * static_cast<uint32_t>(sizeof(Barrier))));
     });
 
-    if (warp_idx == kNumMathThreads / 32 + 1 and cute::elect_one_sync()) {
+    if (warp_idx == kNumMathThreads / 32 and cute::elect_one_sync()) {
+        cute::prefetch_tma_descriptor(&tensor_map_a_base);
+        cute::prefetch_tma_descriptor(&tensor_map_b_base);
+        cute::prefetch_tma_descriptor(&tensor_map_cd);
         if constexpr (kGemmType == GemmType::KGroupedContiguous) {
             *smem_tensor_map_a = tensor_map_a_base;
             *smem_tensor_map_b = tensor_map_b_base;
@@ -138,7 +136,6 @@ sm120_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
         #pragma unroll
         for (uint32_t i = 0; i < kNumStages; ++ i) {
             full_barriers[i]->init(1);
-            // No multicast on SM120 -> just kNumMathThreads/32 consumer warps
             empty_barriers[i]->init(kNumMathThreads / 32);
         }
         cutlass::arch::fence_barrier_init();
@@ -167,7 +164,7 @@ sm120_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
     uint32_t iter_idx = 0;
 
     // ========================================================================
-    //  TMA warp-group (128 threads; one warp actually issues TMAs)
+    //  TMA warp-group (32 or 128 threads; one warp issues TMAs)
     // ========================================================================
     if (warp_idx >= kNumMathThreads / 32) {
         if (warp_idx == kNumMathThreads / 32 and cute::elect_one_sync()) {
@@ -225,7 +222,6 @@ sm120_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
     } else {
         const auto math_wg_idx = __shfl_sync(0xffffffff, threadIdx.x / 128, 0);
         const auto row_idx = lane_idx / 4, col_idx = lane_idx % 4;
-        const auto r_0 = warp_idx * 16 + row_idx, r_1 = r_0 + 8;
 
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
             DG_STATIC_ASSERT(BLOCK_M == MMA::M * (BLOCK_M <= 64 ? 1 : 2), "Invalid block sizes");
@@ -277,30 +273,57 @@ sm120_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
                 empty_barrier_arrive(stage_idx);
             }
 
-            // -------- Epilogue --------
-            if (warp_idx % 4 == 0 and cute::elect_one_sync())
-                cute::tma_store_wait<0>();
-            cutlass::arch::NamedBarrier::sync(128, math_wg_idx);
+            // -------- Epilogue (64-row D buffer) --------
+            // r_0 indexes the full BLOCK_M tile (TMA gmem M); r_d_* indexes the
+            // 64-row smem box. tma_store_wait is per-issuer, so the two math
+            // WGs for BLOCK_M==128 wait on the thread that issued the previous
+            // TMA before reusing the buffer.
+            const auto r_d_0 = (warp_idx % 4) * 16 + row_idx;
+            const auto r_d_1 = r_d_0 + 8;
+            const bool is_tma_issuer = (warp_idx % 4 == 0) and cute::elect_one_sync();
+            constexpr uint32_t kEpiBar = 2;
 
-            const auto smem_d_0 = reinterpret_cast<float2*>(smem_d + r_0 * BLOCK_N + col_idx * 2);
-            const auto smem_d_1 = reinterpret_cast<float2*>(smem_d + r_1 * BLOCK_N + col_idx * 2);
-            #pragma unroll
-            for (auto i = 0; i < MMA::kNumAccum / 4; ++ i) {
-                ptx::st_shared(smem_d_0 + i * 4, {accum[i * 4 + 0], accum[i * 4 + 1]});
-                ptx::st_shared(smem_d_1 + i * 4, {accum[i * 4 + 2], accum[i * 4 + 3]});
-            }
-            cute::tma_store_fence();
-            cutlass::arch::NamedBarrier::sync(128, math_wg_idx);
+            auto wait_own_tma = [&]() {
+                if (is_tma_issuer)
+                    cute::tma_store_wait<0>();
+            };
+            auto store_and_tma = [&]() {
+                wait_own_tma();
+                cutlass::arch::NamedBarrier::sync(128, math_wg_idx);
 
-            // TMA store with reduce-add-2D — the accumulation semantics (D += A@B when
-            // C is provided) are preserved because gemm.hpp copies C into D up-front.
-            if (warp_idx % 4 == 0 and cute::elect_one_sync()) {
-                cute::SM90_TMA_REDUCE_ADD_2D::copy(
-                    &tensor_map_cd, smem_d_0, n_block_idx * BLOCK_N,
-                    current_group_idx * shape_m + m_block_idx * BLOCK_M + r_0);
-                cute::tma_store_arrive();
+                const auto smem_d_0 = reinterpret_cast<float2*>(smem_d + r_d_0 * BLOCK_N + col_idx * 2);
+                const auto smem_d_1 = reinterpret_cast<float2*>(smem_d + r_d_1 * BLOCK_N + col_idx * 2);
+                #pragma unroll
+                for (auto i = 0; i < MMA::kNumAccum / 4; ++ i) {
+                    ptx::st_shared(smem_d_0 + i * 4, {accum[i * 4 + 0], accum[i * 4 + 1]});
+                    ptx::st_shared(smem_d_1 + i * 4, {accum[i * 4 + 2], accum[i * 4 + 3]});
+                }
+                cute::tma_store_fence();
+                cutlass::arch::NamedBarrier::sync(128, math_wg_idx);
+
+                if (is_tma_issuer) {
+                    cute::SM90_TMA_REDUCE_ADD_2D::copy(
+                        &tensor_map_cd, smem_d_0, n_block_idx * BLOCK_N,
+                        current_group_idx * shape_m + m_block_idx * BLOCK_M + math_wg_idx * MMA::M);
+                    cute::tma_store_arrive();
+                }
+                __syncwarp();
+            };
+
+            if constexpr (BLOCK_M > 64) {
+                if (math_wg_idx == 0) {
+                    store_and_tma();
+                    wait_own_tma();
+                }
+                cutlass::arch::NamedBarrier::sync(256, kEpiBar);
+                if (math_wg_idx == 1) {
+                    store_and_tma();
+                    wait_own_tma();
+                }
+                cutlass::arch::NamedBarrier::sync(256, kEpiBar);
+            } else {
+                store_and_tma();
             }
-            __syncwarp();
         }
     }
 #else

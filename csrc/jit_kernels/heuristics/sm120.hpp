@@ -6,6 +6,7 @@
 #include "common.hpp"
 #include "utils.hpp"
 #include "../../utils/exception.hpp"
+#include "../../utils/system.hpp"
 
 namespace deep_gemm {
 
@@ -38,15 +39,18 @@ struct SM120ArchSpec {
         DG_HOST_ASSERT(desc.cd_dtype == torch::kFloat);
         DG_HOST_ASSERT(desc.get_mma_kind() == MmaKind::MXFP8FP4);
 
-        // Block M candidates
+        // Block M / N candidates. `DG_SM120_BLOCK_M` + `DG_SM120_BLOCK_N` pin a
+        // single tile for sweeps (must still fit >= 2 stages).
         std::vector<int> block_m_candidates = {64, 128};
-
-        // Block N candidates:  multiples of 8 (per m16n8k32).  Keep the list
-        // small-ish to bound compilation time; the kernel body unrolls
-        // `BLOCK_N / 8` mma issues per K step.
         std::vector<int> block_n_candidates;
         for (int n = 16; n <= 128; n += 16)
             block_n_candidates.push_back(n);
+        if (const int forced_m = get_env<int>("DG_SM120_BLOCK_M"); forced_m > 0) {
+            const int forced_n = get_env<int>("DG_SM120_BLOCK_N");
+            DG_HOST_ASSERT(forced_n > 0 and "DG_SM120_BLOCK_N required with DG_SM120_BLOCK_M");
+            block_m_candidates = {forced_m};
+            block_n_candidates = {forced_n};
+        }
 
         const int block_k = 128;
 
@@ -85,10 +89,35 @@ struct SM120ArchSpec {
         };
     }
 
+    static int tma_threads() {
+        const int v = get_env<int>("DG_SM120_TMA_THREADS", 32);
+        return v == 128 ? 128 : 32;
+    }
+
+    static int requested_cta_per_sm() {
+        int v = get_env<int>("DG_SM120_CTA_PER_SM", 1);
+        return v < 1 ? 1 : (v > 2 ? 2 : v);
+    }
+
+    // 384-thread CTAs at 2/SM overflow the 64K register file (~85 regs/thread).
+    static int cta_per_sm_for_layout(const Layout& layout) {
+        int cta = requested_cta_per_sm();
+        const int threads = tma_threads() + (layout.block_m <= 64 ? 128 : 256);
+        // 2 CTA/SM needs <= 128 regs/thread: 65536 / (2 * threads) >= 128 → threads <= 256.
+        if (cta >= 2 and threads > 256)
+            cta = 1;
+        return cta;
+    }
+
     static PipelineConfig get_pipeline_config(const GemmDesc& desc, const Layout& layout, const StorageConfig& storage_config) {
         constexpr int kNumMaxStages = 8;
 
-        const int smem_cd = align(layout.block_m * layout.block_n * static_cast<int>(c10::elementSize(desc.cd_dtype)), 1024);
+        // Epilogue TMA box is store_block_m x store_block_n (64 x N). Two math
+        // warp-groups for BLOCK_M==128 serialize onto that buffer, so do not
+        // budget a full BLOCK_M-row D tile — that 20–40 KB is what pinned
+        // 128x80 at 2 stages / 1 CTA. Without 1D1D scale smem, 128x80 fits 3.
+        const int smem_cd = align(storage_config.store_block_m * storage_config.store_block_n *
+                                  static_cast<int>(c10::elementSize(desc.cd_dtype)), 1024);
         const int smem_barriers = kNumMaxStages * 8 * 2;
 
         const int smem_a_per_stage = storage_config.load_block_m * layout.block_k * c10::elementSize(desc.a_dtype);
@@ -99,7 +128,8 @@ struct SM120ArchSpec {
 
         const int smem_extra = smem_cd + smem_barriers + smem_tensormap;
         const int smem_per_stage = smem_a_per_stage + smem_b_per_stage;
-        int num_stages = std::min((smem_capacity - smem_extra) / std::max(1, smem_per_stage), kNumMaxStages);
+        const int budget = smem_capacity / cta_per_sm_for_layout(layout);
+        int num_stages = std::min((budget - smem_extra) / std::max(1, smem_per_stage), kNumMaxStages);
         num_stages = std::max(num_stages, 1);
 
         return {
@@ -109,14 +139,16 @@ struct SM120ArchSpec {
     }
 
     static LaunchConfig get_launch_config(const GemmDesc& desc, const Layout& layout) {
-        const int num_tma_threads = 128;
+        const int num_tma_threads = tma_threads();
         const int num_math_threads = layout.block_m <= 64 ? 128 : 256;
+        const int cta = cta_per_sm_for_layout(layout);
         return {
-            desc.num_sms,
+            desc.num_sms * cta,
             /*num_sms_per_cluster=*/1,
             num_tma_threads + num_math_threads,
             num_tma_threads, num_math_threads,
-            0, 0
+            0, 0,
+            cta
         };
     }
 

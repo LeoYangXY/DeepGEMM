@@ -128,6 +128,7 @@ struct LaunchConfig {
     int num_math_threads;
     int num_non_epilogue_threads;
     int num_epilogue_threads;
+    int min_blocks_per_sm = 1;
 
     friend std::ostream& operator << (std::ostream& os, const LaunchConfig& config) {
         os << "LaunchConfig("
@@ -135,7 +136,8 @@ struct LaunchConfig {
            << ", num_threads=" << config.num_threads
            << ", num_tma_threads=" << config.num_tma_threads << ", num_math_threads=" << config.num_math_threads
            << ", num_non_epilogue_threads=" << config.num_non_epilogue_threads
-           << ", num_epilogue_threads=" << config.num_epilogue_threads << ")";
+           << ", num_epilogue_threads=" << config.num_epilogue_threads
+           << ", min_blocks_per_sm=" << config.min_blocks_per_sm << ")";
         return os;
     }
 };

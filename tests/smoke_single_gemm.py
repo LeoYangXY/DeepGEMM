@@ -4,12 +4,26 @@
     ./setup_env.sh tests/smoke_single_gemm.py
 """
 
+import subprocess
+
 import torch
 
 import deep_gemm
 from deep_gemm.testing import calc_diff, get_arch_major
 
 from generators import KernelType, MajorTypeAB, QuantConfig, get_ue8m0_usage, generate_normal
+
+
+def gpu_clocks() -> str:
+    """Current SM/mem clocks. WSL2 cannot lock them without Windows admin `nvidia-smi -lgc`."""
+    try:
+        return subprocess.check_output(
+            ['nvidia-smi',
+             '--query-gpu=clocks.sm,clocks.mem,clocks.max.sm',
+             '--format=csv,noheader,nounits'],
+            text=True).strip()
+    except Exception:
+        return 'n/a'
 
 
 def bench(fn, num_warmup: int = 10, num_iters: int = 50) -> float:
@@ -69,7 +83,7 @@ def test_fp8_1d1d(m: int, n: int, k: int) -> None:
     print(f'  [{tag:9}] m={m:6d} n={n:6d} k={k:6d} | diff={diff:.6f} | '
           f'DeepGEMM {t * 1e6:8.1f} us {tflops:7.1f} TFLOPS | '
           f'cuBLASLt {t_cublas * 1e6:8.1f} us {tflops_cublas:7.1f} TFLOPS | '
-          f'{t_cublas / t:.2f}x cuBLASLt')
+          f'{t_cublas / t:.2f}x cuBLASLt | clk {gpu_clocks()}')
     assert diff < 1e-3, f'FP8 GEMM 精度不达标: {diff}'
 
 
@@ -96,6 +110,7 @@ if __name__ == '__main__':
     print(f'device      : {torch.cuda.get_device_name(0)}')
     print(f'arch major  : {get_arch_major()}')
     print(f'num sms     : {deep_gemm.get_num_sms()}')
+    print(f'gpu clocks  : {gpu_clocks()}  (sm, mem, max.sm MHz; lock from Windows admin: nvidia-smi -lgc)')
 
     print('== 单个 GEMM smoke test ==')
     if get_arch_major() in (9, 10):
