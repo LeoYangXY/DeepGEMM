@@ -30,7 +30,10 @@ static void check_major_type_cd(const torch::Tensor& t) {
 }
 
 static bool fp8_requires_k_major() {
-    return device_runtime->get_arch_major() == 9;
+    // SM90 (Hopper) requires K-major for wgmma FP8 inputs.
+    // SM120 (Blackwell consumer) — our port also uses K-major shared tiles.
+    const auto arch = device_runtime->get_arch_major();
+    return arch == 9 or arch == 12;
 }
 
 // Tensor utils
@@ -77,6 +80,11 @@ get_default_recipe(const torch::ScalarType& sfa_dtype, const torch::ScalarType& 
     if (arch_major == 9) {
         DG_HOST_ASSERT(sfa_dtype == torch::kFloat and sfb_dtype == torch::kFloat);
         return {1, 128, 128};
+    } else if (arch_major == 12) {
+        // SM120 kernel ignores scales (raw FP8). Keep a 1x128 FP32 recipe so
+        // existing `fp8_fp4_gemm_nt` callers still construct valid SF tensors.
+        DG_HOST_ASSERT(sfa_dtype == torch::kFloat and sfb_dtype == torch::kFloat);
+        return {1, 1, 128};
     } else if (arch_major == 10) {
         DG_HOST_ASSERT(sfb_dtype == torch::kFloat or sfb_dtype == torch::kInt);
         return sfb_dtype == torch::kFloat ?

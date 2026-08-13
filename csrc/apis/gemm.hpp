@@ -8,6 +8,7 @@
 #include "../jit_kernels/impls/sm90_bf16_gemm.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm100_bf16_gemm.hpp"
+#include "../jit_kernels/impls/sm120_fp8_gemm_1d1d.hpp"
 #endif 
 
 #include "../jit_kernels/impls/smxx_cublaslt.hpp"
@@ -101,6 +102,14 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
     // Early return for trivial cases
     if (early_return(m, n, k, d, c))
         return;
+
+    // Blackwell consumer (e.g. RTX 5050 sm_120a): raw FP8, FP32 D.
+    // Scales on `a.second` / `b.second` are ignored (cuBLASLt-aligned math).
+    if (arch_major == 12) {
+        DG_HOST_ASSERT(d.scalar_type() == torch::kFloat);
+        sm120_fp8_gemm_1d1d(a.first, b.first, c, d, m, n, k, major_a, major_b, compiled_dims);
+        return;
+    }
 
     // Transform SFA and SFB into compute-required layout
     const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(

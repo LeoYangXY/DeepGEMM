@@ -13,6 +13,13 @@
 #include <torch/csrc/Dtype.h>
 #include <torch/csrc/DynamicTypes.h>
 #include <c10/core/ScalarType.h>
+// NOTES: torch 2.6+ moved TORCH_VERSION_* macros into `torch/headeronly/version.h`
+// and stopped pulling it in through the top-level `torch/version.h` in some
+// builds.  Include it explicitly so the version gate below works on all
+// supported PyTorch versions.
+#if __has_include(<torch/headeronly/version.h>)
+#  include <torch/headeronly/version.h>
+#endif
 
 // PyTorch 2.2 起自带该 caster，用版本宏区分，避免重复定义
 #if !defined(TORCH_VERSION_MAJOR) || \
