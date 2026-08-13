@@ -4,8 +4,12 @@
 //  Purpose
 //  -------
 //  Consumer Blackwell (sm_120) has no wgmma.  Math is the warp-level
-//    `mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32`
-//  which lowers to SASS `QMMA.16832.F32.E4M3.E4M3`.
+//    `mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X
+//         .m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0`
+//  which lowers to SASS `QMMA.SF.16832.F32.E4M3.E4M3.E8`.
+//  Unscaled `QMMA.16832.F32.E4M3.E4M3` is half-rate on RTX 50; SF with
+//  identity ue8m0=127 (scale=1) is the full-rate path.  Kernel math is
+//  raw FP8 (D = A@B); identity SF does not change numerics.
 //
 //  Shared-memory path
 //  ------------------
@@ -51,16 +55,25 @@ __device__ __forceinline__ void mma_m16n8k32_f32_e4m3_e4m3(
         const uint32_t& a0, const uint32_t& a1, const uint32_t& a2, const uint32_t& a3,
         const uint32_t& b0, const uint32_t& b1,
         const float& c0, const float& c1, const float& c2, const float& c3) {
+    // ue8m0(127) == 2^0 == 1.  Same numerics as unscaled MMA; full-rate SASS.
+    const uint32_t sfa = 127u, sfb = 127u;
+    const uint16_t bidA = 0, tidA = 0, bidB = 0, tidB = 0;
     asm volatile(
-        "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+        "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
         "{%0, %1, %2, %3}, "
         "{%4, %5, %6, %7}, "
         "{%8, %9}, "
-        "{%10, %11, %12, %13};\n"
+        "{%10, %11, %12, %13}, "
+        "{%14}, "
+        "{%15, %16}, "
+        "{%17}, "
+        "{%18, %19};\n"
         : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
           "r"(b0), "r"(b1),
-          "f"(c0), "f"(c1), "f"(c2), "f"(c3));
+          "f"(c0), "f"(c1), "f"(c2), "f"(c3),
+          "r"(sfa), "h"(bidA), "h"(tidA),
+          "r"(sfb), "h"(bidB), "h"(tidB));
 }
 
 // --------------------------------------------------------------------------

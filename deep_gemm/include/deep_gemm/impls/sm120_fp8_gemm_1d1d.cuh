@@ -33,8 +33,8 @@ namespace deep_gemm {
 //  Same math as `cublaslt_gemm_nt` on the raw FP8 tensors.
 //
 //  What changed vs. the SM90 1D1D kernel (structurally):
-//    * The math backend uses classic warp-level `mma.sync m16n8k32` instead of
-//      Hopper's `wgmma.mma_async` (sm_120 has no wgmma).
+//    * The math backend uses warp-level `mma.sync` QMMA.SF (identity ue8m0)
+//      instead of Hopper's `wgmma.mma_async` (sm_120 has no wgmma).
 //    * All `warpgroup_reg_alloc / dealloc / arrive / commit_batch / wait /
 //      fence_operand` intrinsics are removed (they don't exist on sm_120).
 //    * TMA multicast / cluster >= 2 are disabled by the host-side heuristics
