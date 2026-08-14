@@ -212,6 +212,25 @@ load_a_fragment_ldsm(a_frag[...], a_base, k_off, lane_id);
 
 ---
 
+## 6b. 128×128 2-stage（D 缩小之后）
+
+Tile 换成 `128×128×128`、TMA 32 线程（288 thread）之后，4096³ 同轮大约 **0.95–0.99× cuBLAS**。内环 dump：`docs/sm120_sass/qmma_sf_128x128_inner.sass`。
+
+一个 K-block 64 条 QMMA.SF（`4 k-step × 16 n8`），unroll 2 stage → dump 里 128 条。空隙统计（改 C++ 3-deep B 预取 / 提前 arrive 之后 **直方图不变**）：
+
+| 空隙 | 条数 | 含义 |
+|---|---:|---|
+| 相邻 QMMA | 77 | 连发 |
+| 一条 LDSM | 41 | 藏在 Tensor 影子里 |
+| 两条 LDSM | 5 | k-step 交界要同时备下一拍 A 和 B[0] |
+| MOV/SHF / SYNCS | 2 | 下一 stage 的 mbarrier 地址和 TRYWAIT |
+
+源码现在是 3-live/1-fill（`BLOCK_N>=48`）并把 `arrive empty` 写在最后一次 B LDSM 后面；ptxas 仍吐 77/41/5，并把 arrive 沉到和下一次 wait 挨着。寄存器 148→135，2 CTA 仍不够（288 thread 要 ≤113）。把 math 循环收成 `#pragma unroll 1` 会让 swizzle `IADD` 重新进 QMMA 窗口，更差。
+
+`000fca00` 仍只出现在 scheduler / TMA 序言，不在 math burst。真正还能改 SASS 的锤子是整段 K-block 的 fused PTX，不是再调 C++ 顺序。
+
+---
+
 ## 7. 两分钟讲稿（可以按这个背）
 
 1. **目标：** 全速 `QMMA.SF` 连发，控制字 `000ff600`。一条 8192 FLOP。
@@ -228,6 +247,7 @@ load_a_fragment_ldsm(a_frag[...], a_base, k_off, lane_id);
 | 路径 | 内容 |
 |---|---|
 | `docs/sm120_fp8_sass_hand_schedule.md` | 本页 |
-| `docs/sm120_sass/qmma_sf_inner_loop.sass` | 4096³ 内层循环原文 |
+| `docs/sm120_sass/qmma_sf_inner_loop.sass` | 4096³ `128×80` 内层循环原文 |
+| `docs/sm120_sass/qmma_sf_128x128_inner.sass` | 4096³ `128×128` TMA32 内层循环 |
 | `tests/sm120_inst_microbench.cu` | QMMA / QMMA.SF / FFMA / IMAD |
 | `deep_gemm/include/deep_gemm/mma/sm120.cuh` | `mma_kblock_ldsm` 的软件流水 |

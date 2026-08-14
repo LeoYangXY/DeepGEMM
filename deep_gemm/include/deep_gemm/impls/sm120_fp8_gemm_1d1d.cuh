@@ -145,7 +145,8 @@ sm120_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
     __syncthreads();
 
     // Full unroll of the K pipeline in Normal mode; disable it for KGrouped
-    // where K is dynamic per group.
+    // where K is dynamic per group. Math must unroll with the TMA loop:
+    // a rolled math body rematerializes swizzle IADD into the QMMA window.
     constexpr uint32_t kNumPipelineUnrolls = (kGemmType == GemmType::KGroupedContiguous ? 0 : kNumStages);
 
     // Programmatic Dependent Launch handoff (safe no-op if not enabled)
@@ -240,37 +241,17 @@ sm120_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
                 CUTE_TIE_DECL(get_pipeline(iter_idx ++), stage_idx, phase);
                 full_barriers[stage_idx]->wait(phase);
 
-                // -------- Warp-level FP8 MMA main loop (m16n8k32 tiles) --------
-                // Per-warp view (warp = warp_idx % 4 inside its warp-group):
-                //   * covers M rows [warp*16, warp*16+16) within the warp-group's 64-row slab
-                //   * emits `BLOCK_N/8` output n-tiles of shape m16n8
-                //   * K is scanned in 4 steps of 32 (since BLOCK_K == 128)
-                //
-                // The per-warp M base within the full BLOCK_M smem tile is:
-                //   m_row_base = math_wg_idx * MMA::M + (warp_idx % 4) * 16
-                // (i.e. warp-group `math_wg_idx` handles a 64-row slab, and each of
-                //  its 4 warps handles a 16-row sub-slab).
-                //
-                // Accumulator layout in `accum[]` mirrors SM90's per-lane layout:
-                //   for n8 tile `i`:
-                //     accum[i*4 + 0] -> row r_0, col (col_idx*2 + 0)
-                //     accum[i*4 + 1] -> row r_0, col (col_idx*2 + 1)
-                //     accum[i*4 + 2] -> row r_1, col (col_idx*2 + 0)
-                //     accum[i*4 + 3] -> row r_1, col (col_idx*2 + 1)
-                //   which matches mma m16n8k32's D fragment exactly.
+                // Warp `warp_idx%4` owns 16 rows of the WG's 64-row slab.
                 const uint32_t warp_in_wg  = warp_idx & 3;
                 const uint32_t m_row_base  = math_wg_idx * MMA::M + warp_in_wg * 16;
-                constexpr uint32_t LDA = BLOCK_K;  // K-major A row stride, in fp8 bytes
+                constexpr uint32_t LDA = BLOCK_K;
 
                 auto* a_tile = smem_a[stage_idx] + m_row_base * LDA;
                 auto* b_tile = smem_b[stage_idx];
 
-                // Software-pipelined ldmatrix.x4 + QMMA over the 128-K block.
-                // MMA is D = A*B + C, so `accum` folds K-blocks in place.
-                mma::sm120::mma_kblock_ldsm<BLOCK_N>(accum, a_tile, b_tile, lane_idx);
-
-                // Notify TMA: this stage's data has been fully consumed
-                empty_barrier_arrive(stage_idx);
+                mma::sm120::mma_kblock_ldsm<BLOCK_N>(accum, a_tile, b_tile, lane_idx, [&]() {
+                    empty_barrier_arrive(stage_idx);
+                });
             }
 
             // -------- Epilogue (64-row D buffer) --------

@@ -107,6 +107,21 @@ __device__ __forceinline__ void ldmatrix_x2(uint32_t& d0, uint32_t& d1, const ui
         : "r"(addr));
 }
 
+__device__ __forceinline__ uint32_t a_ldsm_addr(
+        const uint32_t a_tile_u32, const uint32_t k_off, const uint32_t lane_id) {
+    const uint32_t row = lane_id & 15u;
+    const uint32_t col = k_off + ((lane_id >> 4) << 4);
+    return swizzle_128b_addr(a_tile_u32, row, col);
+}
+
+__device__ __forceinline__ uint32_t b_ldsm_x2n_addr(
+        const uint32_t b_tile_u32, const uint32_t n_base,
+        const uint32_t k_off, const uint32_t lane_id) {
+    const uint32_t n_row = n_base + (lane_id & 7u) + ((lane_id & 16u) >> 1);
+    const uint32_t col   = k_off + ((lane_id & 8u) << 1);
+    return swizzle_128b_addr(b_tile_u32, n_row, col);
+}
+
 // --------------------------------------------------------------------------
 //  A fragment: one m16 x k32 FP8 tile occupying 16 rows of a K-major 128B-
 //  swizzled buffer.  CUTLASS / mma.sync convention:
@@ -118,9 +133,7 @@ __device__ __forceinline__ void load_a_fragment_ldsm(
         const uint32_t a_tile_u32,     // start of this warp's 16 rows, k = 0
         const uint32_t k_off,          // 0, 32, 64, 96
         const uint32_t lane_id) {
-    const uint32_t row = lane_id & 15u;
-    const uint32_t col = k_off + ((lane_id >> 4) << 4);   // k_off or k_off+16
-    ldmatrix_x4(a[0], a[1], a[2], a[3], swizzle_128b_addr(a_tile_u32, row, col));
+    ldmatrix_x4(a[0], a[1], a[2], a[3], a_ldsm_addr(a_tile_u32, k_off, lane_id));
 }
 
 // --------------------------------------------------------------------------
@@ -157,86 +170,90 @@ __device__ __forceinline__ void load_b_fragment_ldsm_x2n(
         const uint32_t n_base,
         const uint32_t k_off,
         const uint32_t lane_id) {
-    const uint32_t n_row = n_base + (lane_id & 7u) + ((lane_id & 16u) >> 1);
-    const uint32_t col   = k_off + ((lane_id & 8u) << 1);
-    ldmatrix_x4(b[0], b[1], b[2], b[3], swizzle_128b_addr(b_tile_u32, n_row, col));
+    ldmatrix_x4(b[0], b[1], b[2], b[3], b_ldsm_x2n_addr(b_tile_u32, n_base, k_off, lane_id));
 }
 
 // --------------------------------------------------------------------------
 //  Software-pipelined K-block MMA (BLOCK_K = 128 = 4 x k32).
 //
-//  Schedule (per k-step), chosen so LDSM of the next B tile sits in the
-//  shadow of the current QMMA (different pipes: LSU vs Tensor):
-//      prologue:  LDSM A[k=0], LDSM B[n=0,k=0]
-//      for k:
-//          LDSM A[k+1]            // overlap with the whole N sweep
-//          for n2 in 0 .. BLOCK_N/16:
-//              LDSM B[n2+1]       // overlap with 2x QMMA of n2
-//              QMMA n2*2
-//              QMMA n2*2+1
-//  SASS walk-through: docs/sm120_fp8_sass_hand_schedule.md.
-//
-//  BLOCK_N is a multiple of 16 (heuristics).  Accumulators stay in RF and
-//  are only written by QMMA, so the two n8 MMAs of one x4 B-load are
-//  independent of each other and of the next LDSM.
+//  A[k+1] is issued at the start of k-step k so it hides in the whole N sweep.
+//  B is 3-live / 1-fill when BLOCK_N >= 48 (4 RF slots): LDSM B[g+3] writes the
+//  free slot *between* the two QMMAs of pair g (LSU vs Tensor).  Narrower N
+//  keeps 2-slot ping-pong.  `arrive_after_last_ldsm` runs after the last B
+//  LDSM so TMA can refill this stage during the tail QMMAs.
 // --------------------------------------------------------------------------
-template <uint32_t BLOCK_N>
+template <uint32_t BLOCK_N, typename Arrive>
 __device__ __forceinline__ void mma_kblock_ldsm(
         float* accum,
         const __nv_fp8_e4m3* smem_a_warp,   // 16 rows x 128 K, 128B-swizzled
         const __nv_fp8_e4m3* smem_b,        // BLOCK_N x 128 K, 128B-swizzled
-        const uint32_t lane_id) {
-    static constexpr uint32_t kKSteps  = 4;            // 128 / 32
-    static constexpr uint32_t kNPairs  = BLOCK_N / 16; // two n8 tiles per LDSM.x4
-    static constexpr uint32_t kNTiles  = BLOCK_N / 8;
+        const uint32_t lane_id,
+        Arrive&& arrive_after_last_ldsm) {
+    static constexpr uint32_t kKSteps   = 4;            // 128 / 32
+    static constexpr uint32_t kNPairs   = BLOCK_N / 16; // two n8 tiles per LDSM.x4
+    static constexpr uint32_t kTotal    = kKSteps * kNPairs;
+    static constexpr uint32_t kBLive    = (kNPairs >= 3u) ? 3u : 1u;
+    static constexpr uint32_t kSlots    = (kNPairs >= 3u) ? 4u : 2u;
 
     const uint32_t a_base = smem_u32(smem_a_warp);
     const uint32_t b_base = smem_u32(smem_b);
 
     uint32_t a_frag[2][4];
-    uint32_t b_frag[2][4];
+    uint32_t b_frag[kSlots][4];
 
-    // Addresses are computed inside load_*_fragment_ldsm (swizzle XOR per issue).
     load_a_fragment_ldsm(a_frag[0], a_base, 0, lane_id);
+    #pragma unroll
+    for (uint32_t p = 0; p < kBLive; ++ p)
+        load_b_fragment_ldsm_x2n(b_frag[p], b_base, p * 16u, 0, lane_id);
 
     #pragma unroll
     for (uint32_t k_step = 0; k_step < kKSteps; ++ k_step) {
         const uint32_t a_stage = k_step & 1u;
         const uint32_t k_off = k_step * 32u;
-
         if (k_step + 1u < kKSteps)
             load_a_fragment_ldsm(a_frag[a_stage ^ 1u], a_base, k_off + 32u, lane_id);
 
-        // B ping-pong is only within a k-step.  Crossing k-steps with an odd
-        // kNPairs (BLOCK_N=16) would read a stale fragment.
-        load_b_fragment_ldsm_x2n(b_frag[0], b_base, 0, k_off, lane_id);
-
         #pragma unroll
         for (uint32_t n_pair = 0; n_pair < kNPairs; ++ n_pair) {
-            const uint32_t b_stage = n_pair & 1u;
-
-            if (n_pair + 1u < kNPairs)
-                load_b_fragment_ldsm_x2n(b_frag[b_stage ^ 1u], b_base,
-                                         (n_pair + 1u) * 16u, k_off, lane_id);
-
+            const uint32_t global = k_step * kNPairs + n_pair;
+            const uint32_t use_slot = global % kSlots;
             float* d0 = accum + (n_pair * 2u) * 4u;
             float* d1 = accum + (n_pair * 2u + 1u) * 4u;
             const uint32_t* a = a_frag[a_stage];
-            const uint32_t* b = b_frag[b_stage];
+            const uint32_t* b = b_frag[use_slot];
 
             mma_m16n8k32_f32_e4m3_e4m3(
                 d0[0], d0[1], d0[2], d0[3],
                 a[0], a[1], a[2], a[3],
                 b[0], b[1],
                 d0[0], d0[1], d0[2], d0[3]);
+
+            const uint32_t next = global + kBLive;
+            if (next < kTotal) {
+                const uint32_t fill_slot = (use_slot + kBLive) % kSlots;
+                load_b_fragment_ldsm_x2n(b_frag[fill_slot], b_base,
+                                         (next % kNPairs) * 16u,
+                                         (next / kNPairs) * 32u, lane_id);
+                if (next + 1u == kTotal)
+                    arrive_after_last_ldsm();
+            }
+
             mma_m16n8k32_f32_e4m3_e4m3(
                 d1[0], d1[1], d1[2], d1[3],
                 a[0], a[1], a[2], a[3],
                 b[2], b[3],
                 d1[0], d1[1], d1[2], d1[3]);
         }
-        (void)kNTiles;
     }
+}
+
+template <uint32_t BLOCK_N>
+__device__ __forceinline__ void mma_kblock_ldsm(
+        float* accum,
+        const __nv_fp8_e4m3* smem_a_warp,
+        const __nv_fp8_e4m3* smem_b,
+        const uint32_t lane_id) {
+    mma_kblock_ldsm<BLOCK_N>(accum, smem_a_warp, smem_b, lane_id, []() {});
 }
 
 // --------------------------------------------------------------------------
