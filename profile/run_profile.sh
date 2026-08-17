@@ -19,7 +19,7 @@
 #      kernel + memcpy。
 #   5. 下面 SECTIONS 已包含全部常用 section（详见同目录 README.md）：
 #      - 基础：SourceCounters / SchedulerStats / ComputeWorkloadAnalysis /
-#              MemoryWorkloadAnalysis / LaunchStats / SpeedOfLight
+#              MemoryWorkloadAnalysis / LaunchStats / Occupancy / SpeedOfLight
 #      - warp 状态：WarpStateStats（含 Stall Long/Short Scoreboard 等）
 #      - 指令与采样：InstructionStats / PmSampling / PmSampling_WarpStates
 #      - CUTEDSL 专用：Tile（TMA/MMA tile 匹配）
@@ -50,6 +50,7 @@ SECTIONS="--section SourceCounters \
 --section MemoryWorkloadAnalysis \
 --section MemoryWorkloadAnalysis_Tables \
 --section LaunchStats \
+--section Occupancy \
 --section InstructionStats \
 --section PmSampling \
 --section PmSampling_WarpStates \
@@ -63,11 +64,13 @@ SECTIONS="--section SourceCounters \
 --section Nvlink \
 --section Nvlink_Tables \
 --section Nvlink_Topology"
-echo ">>> [1/3] ncu: stall_demo (全部 8 个 stall kernel 合并抓 1 份)"
+echo ">>> [1/3] ncu: stall_demo (全部 14 个 stall kernel 合并抓 1 份)"
 # 注意：本机 ncu 2026.1.0 的 --kernel-name 只接受单一精确全名（kernel_.* / 裸前
 # 缀 / 逗号分隔都会报 No kernels were profiled）。因此这里【不指定 --kernel-name】，
 # 让 ncu 默认抓取程序里全部 kernel，写进同一个 stall_demo_all.ncu-rep。
-# stall_demo 的 main 里 8 个 kernel 各 launch 一次、无 warmup，正好全部采到。
+# stall_demo 的 main 里 14 个 kernel 各 launch 一次、无 warmup，正好全部采到。
+# 14 个 kernel 对应 16 个 stall reason；Blackwell sm_120 上部分 reason 被归并到
+# wait（详见 study/stall_demo_walkthrough.md）。
 $NCU --apply-rules on $SECTIONS \
      --import-source yes -f -o stall_demo_all ./stall_demo
 

@@ -1,237 +1,352 @@
+// Prefix Sum (inclusive scan) — 原生 CUDA
+// 编译: nvcc -O3 -std=c++17 -arch=sm_120 -o scan scan.cu && ./scan
+//
+// =============================================================================
+// 算法讲解
+// =============================================================================
+// inclusive scan: out[i] = in[0] + in[1] + ... + in[i]
+// 有数据依赖，不能像 elementwise 那样每个 thread 独立算完。
+//
+// 1) Warp scan (shuffle)
+//    __shfl_up_sync 把 lane i-offset 的值传给 lane i，再累加。
+//    5 步 (offset=1,2,4,8,16) 得到 warp 内 inclusive prefix，零 shared memory。
+//
+// 2) Block scan
+//    每个 warp 先做 warp scan；lane 31 写出 warp total；
+//    warp 0 再 scan 这些 total，得到每个 warp 的 exclusive 前缀；
+//    每个 thread 加上自己所在 warp 的 exclusive 前缀。
+//
+// 3) Device scan (三 kernel，本文件高性能路径)
+//    把每一行切成 TILE=1024 的块 (256 thread × float4):
+//      K1 scan_tiles: 块内 inclusive scan + 写出块总和
+//      K2 exclusive_scan_rows: 对每行的块总和做 exclusive scan
+//      K3 add_tile_prefix: 每个元素加上前面所有块的和
+//    float4 一次搬 16B，读写都 coalesced。N<=1024 时只有一块，K2/K3 直接跳过。
+//
+// Hillis-Steele:  O(N log N) 工作量, log N 轮，实现简单但做了多余加法
+// Blelloch:      O(N) 工作量, 2 log N 轮 (upsweep+downsweep)
+// 本实现:        块内用 warp-shuffle (近似 work-efficient) + 块间三 kernel
+// =============================================================================
+
 #include <cuda_runtime.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <float.h>
-#include <torch/types.h>
-#include <torch/extension.h>
+#include <algorithm>
+#include <cfloat>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
 
-#define CEIL(a, b) ((a + b - 1) / (b))
+#define CUDA_CHECK(call)                                                       \
+  do {                                                                         \
+    cudaError_t err = (call);                                                  \
+    if (err != cudaSuccess) {                                                  \
+      fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__,            \
+              cudaGetErrorString(err));                                        \
+      exit(1);                                                                 \
+    }                                                                          \
+  } while (0)
 
-#define STRINGFY(str) #str
-#define TORCH_BINDING_COMMON_EXTENSION(func) \
-  m.def(STRINGFY(func), &func, STRINGFY(func));
+#define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
 
-#define CHECK_TORCH_TENSOR_DTYPE(T, th_type)                 \
-  if (((T).options().dtype() != (th_type))) {                \
-    std::cout << "Tensor Info:" << (T).options() << std::endl; \
-    throw std::runtime_error("values must be " #th_type);    \
+constexpr int kWarp = 32;
+constexpr int kBlock = 256;
+constexpr int kVec = 4;
+constexpr int kTile = kBlock * kVec; // 1024
+
+// -------------------- primitives --------------------
+
+template <typename T>
+__device__ __forceinline__ T warp_inclusive_scan(T val) {
+  const int lane = threadIdx.x & 31;
+#pragma unroll
+  for (int off = 1; off < kWarp; off <<= 1) {
+    T other = __shfl_up_sync(0xffffffff, val, off);
+    if (lane >= off) val += other;
+  }
+  return val;
+}
+
+template <typename T>
+__device__ __forceinline__ T block_exclusive_scan(T val, T *warp_sums,
+                                                  T &aggregate) {
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int nwarps = blockDim.x >> 5;
+
+  T incl = warp_inclusive_scan(val);
+  if (lane == 31) warp_sums[warp] = incl;
+  __syncthreads();
+
+  if (warp == 0) {
+    T wval = (lane < nwarps) ? warp_sums[lane] : T(0);
+    T wincl = warp_inclusive_scan(wval);
+    if (lane < nwarps) warp_sums[lane] = wincl;
+  }
+  __syncthreads();
+
+  aggregate = warp_sums[nwarps - 1];
+  T warp_excl = (warp == 0) ? T(0) : warp_sums[warp - 1];
+  return warp_excl + incl - val;
+}
+
+// -------------------- kernels --------------------
+
+// baseline: 一行一个 thread，完全串行
+__global__ void scan_naive_kernel(const float *in, float *out, int M, int N) {
+  int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= M) return;
+  const float *ri = in + (long long)row * N;
+  float *ro = out + (long long)row * N;
+  float s = 0.f;
+  for (int i = 0; i < N; ++i) {
+    s += ri[i];
+    ro[i] = s;
+  }
+}
+
+// K1: 每个 block 处理一行里的一个 TILE，float4 向量化
+__global__ void scan_tiles_kernel(const float *__restrict__ in,
+                                  float *__restrict__ out,
+                                  float *__restrict__ tile_sums, int M, int N,
+                                  int tiles_per_row) {
+  __shared__ float warp_sums[kBlock / kWarp];
+
+  const int row = blockIdx.x / tiles_per_row;
+  const int tile = blockIdx.x % tiles_per_row;
+  const int tid = threadIdx.x;
+  const int tile_start = tile * kTile;
+  const int e = tile_start + tid * kVec;
+
+  const float *row_in = in + (long long)row * N;
+  float *row_out = out + (long long)row * N;
+
+  float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+  if (e + 3 < N) {
+    v = *reinterpret_cast<const float4 *>(row_in + e);
+  } else if (e < N) {
+    v.x = row_in[e];
+    if (e + 1 < N) v.y = row_in[e + 1];
+    if (e + 2 < N) v.z = row_in[e + 2];
   }
 
-// ==================== Scan Kernels ====================
-// Cumulative Sum (Prefix Sum) and Cumulative Product
-//
-// 【任务划分逻辑】
-// Prefix scan 有数据依赖 (output[i] 依赖 output[i-1])，不能像 elementwise 那样简单并行
-//
-// ▸ Naive 版本: 一行一个 thread (完全串行)
-//   - grid = M, 每行 1 个 thread 按顺序做 scan
-//   - 适合 N 很小或作为 baseline 对比
-//
-// ▸ Parallel Hillis-Steele Scan (N <= 1024):
-//   - 一行一个 block, block_size = next_power_of_2(N)
-//   - 使用双缓冲 shared memory (2*N floats)
-//   - 每轮 stride *= 2:
-//     if (tid >= stride): dst[tid] = src[tid] + src[tid - stride]
-//     else:               dst[tid] = src[tid]
-//   - O(N*log(N)) 工作量但只需 O(log(N)) 轮，每轮全并行
-//   - 双缓冲避免 read-write conflict: 每轮 swap src/dst
-//   - 适合 N 在几百到一千的场景
-//
-// ▸ Large N: fallback 到串行 (TODO: Blelloch work-efficient scan)
-//
-// ▸ Cumulative Product: 同理串行，因为乘法的 scan 不易并行
-//
-// ▸ Running Sum (滑动窗口求和):
-//   - Naive: 每个 thread 负责 1 个 output, 内循环 K 次
-//   - Prefix-based: 先算 prefix sum, 再 output[i] = prefix[i+1] - prefix[i-K+1]
-//     将 O(N*K) 变为 O(N) (prefix sum 的代价)
+  // 4 个寄存器内的 inclusive scan
+  v.y += v.x;
+  v.z += v.y;
+  v.w += v.z;
 
-// ---- Cumulative Sum (per row) ----
-// 使用 Blelloch scan (work-efficient parallel prefix sum) within each block
-// 对于每行数据，一个block处理
+  float aggregate;
+  float excl = block_exclusive_scan(v.w, warp_sums, aggregate);
+  v.x += excl;
+  v.y += excl;
+  v.z += excl;
+  v.w += excl;
 
-// Simple sequential scan per row (baseline)
-__global__ void cumsum_naive_kernel(const float* input, float* output, int M, int N) {
-    int row = blockIdx.x;
-    const float* row_in = input + row * N;
-    float* row_out = output + row * N;
+  if (e + 3 < N) {
+    *reinterpret_cast<float4 *>(row_out + e) = v;
+  } else if (e < N) {
+    row_out[e] = v.x;
+    if (e + 1 < N) row_out[e + 1] = v.y;
+    if (e + 2 < N) row_out[e + 2] = v.z;
+  }
 
-    float sum = 0.0f;
+  if (tid == 0) {
+    tile_sums[(long long)row * tiles_per_row + tile] = aggregate;
+  }
+}
+
+// K2: 每行一个 block，对 tile_sums 做 in-place exclusive scan
+__global__ void exclusive_scan_rows_kernel(float *data, int n) {
+  __shared__ float warp_sums[kBlock / kWarp];
+  float *row = data + (long long)blockIdx.x * n;
+  const int tid = threadIdx.x;
+  const int chunk = (n + kBlock - 1) / kBlock;
+  const int start = tid * chunk;
+  const int end = min(n, start + chunk);
+
+  float my_total = 0.f;
+  for (int i = start; i < end; ++i) my_total += row[i];
+
+  float aggregate;
+  float excl = block_exclusive_scan(my_total, warp_sums, aggregate);
+
+  float running = excl;
+  for (int i = start; i < end; ++i) {
+    float x = row[i];
+    row[i] = running;
+    running += x;
+  }
+}
+
+// K3: 把前面块的 exclusive 前缀加回每个元素
+__global__ void add_tile_prefix_kernel(float *__restrict__ out,
+                                       const float *__restrict__ tile_excl,
+                                       int M, int N, int tiles_per_row) {
+  const int row = blockIdx.x / tiles_per_row;
+  const int tile = blockIdx.x % tiles_per_row;
+  if (tile == 0) return;
+
+  const float addv = tile_excl[(long long)row * tiles_per_row + tile];
+  const int tile_start = tile * kTile;
+  const int e = tile_start + threadIdx.x * kVec;
+  float *row_out = out + (long long)row * N;
+
+  if (e + 3 < N) {
+    float4 v = *reinterpret_cast<float4 *>(row_out + e);
+    v.x += addv;
+    v.y += addv;
+    v.z += addv;
+    v.w += addv;
+    *reinterpret_cast<float4 *>(row_out + e) = v;
+  } else if (e < N) {
+    row_out[e] += addv;
+    if (e + 1 < N) row_out[e + 1] += addv;
+    if (e + 2 < N) row_out[e + 2] += addv;
+  }
+}
+
+// -------------------- host --------------------
+
+void launch_scan_naive(const float *d_in, float *d_out, int M, int N) {
+  int block = 256;
+  int grid = CEIL_DIV(M, block);
+  scan_naive_kernel<<<grid, block>>>(d_in, d_out, M, N);
+}
+
+void launch_scan_fast(const float *d_in, float *d_out, float *d_tile_sums,
+                      int M, int N) {
+  const int tiles = CEIL_DIV(N, kTile);
+  const int grid = M * tiles;
+  scan_tiles_kernel<<<grid, kBlock>>>(d_in, d_out, d_tile_sums, M, N, tiles);
+  if (tiles > 1) {
+    exclusive_scan_rows_kernel<<<M, kBlock>>>(d_tile_sums, tiles);
+    add_tile_prefix_kernel<<<grid, kBlock>>>(d_out, d_tile_sums, M, N, tiles);
+  }
+}
+
+void scan_cpu(const float *in, float *out, int M, int N) {
+  for (int r = 0; r < M; ++r) {
+    float s = 0.f;
+    const float *ri = in + (long long)r * N;
+    float *ro = out + (long long)r * N;
     for (int i = 0; i < N; ++i) {
-        sum += row_in[i];
-        row_out[i] = sum;
+      s += ri[i];
+      ro[i] = s;
     }
+  }
 }
 
-// Parallel prefix sum using shared memory (Hillis-Steele)
-// 适用于 N <= blockDim.x 的情况
-__global__ void cumsum_parallel_kernel(const float* input, float* output, int M, int N) {
-    extern __shared__ float smem[];  // 2 * N
-
-    int row = blockIdx.x;
-    int tid = threadIdx.x;
-    const float* row_in = input + row * N;
-    float* row_out = output + row * N;
-
-    float* buf0 = smem;
-    float* buf1 = smem + N;
-
-    // Load
-    buf0[tid] = (tid < N) ? row_in[tid] : 0.0f;
-    __syncthreads();
-
-    // Hillis-Steele scan
-    float* src = buf0;
-    float* dst = buf1;
-    for (int stride = 1; stride < N; stride <<= 1) {
-        if (tid < N) {
-            if (tid >= stride) {
-                dst[tid] = src[tid] + src[tid - stride];
-            } else {
-                dst[tid] = src[tid];
-            }
-        }
-        __syncthreads();
-        // swap
-        float* tmp = src;
-        src = dst;
-        dst = tmp;
-        __syncthreads();
-    }
-
-    if (tid < N) {
-        row_out[tid] = src[tid];
-    }
+float max_abs_diff(const float *a, const float *b, int n) {
+  float m = 0.f;
+  for (int i = 0; i < n; ++i) m = fmaxf(m, fabsf(a[i] - b[i]));
+  return m;
 }
 
-// Block-level scan for large N: each block handles a chunk, then fixup
-// 使用 grid-stride 的方式处理大 N
-__global__ void cumsum_large_kernel(const float* input, float* output, int N) {
-    // 每个row由一个block按顺序处理
-    // block内的threads协作处理chunks
-    int row = blockIdx.x;
-    const float* row_in = input + row * N;
-    float* row_out = output + row * N;
-
-    // 简单实现: thread 0 做 sequential scan (对于大N这是baseline)
-    if (threadIdx.x == 0) {
-        float sum = 0.0f;
-        for (int i = 0; i < N; ++i) {
-            sum += row_in[i];
-            row_out[i] = sum;
-        }
-    }
+float bench_ms(void (*fn)(void *), void *ctx, int warmup, int rep) {
+  for (int i = 0; i < warmup; ++i) fn(ctx);
+  CUDA_CHECK(cudaDeviceSynchronize());
+  cudaEvent_t a, b;
+  CUDA_CHECK(cudaEventCreate(&a));
+  CUDA_CHECK(cudaEventCreate(&b));
+  CUDA_CHECK(cudaEventRecord(a));
+  for (int i = 0; i < rep; ++i) fn(ctx);
+  CUDA_CHECK(cudaEventRecord(b));
+  CUDA_CHECK(cudaEventSynchronize(b));
+  float ms = 0.f;
+  CUDA_CHECK(cudaEventElapsedTime(&ms, a, b));
+  CUDA_CHECK(cudaEventDestroy(a));
+  CUDA_CHECK(cudaEventDestroy(b));
+  return ms / rep;
 }
 
-// ---- Cumulative Product (per row) ----
-__global__ void cumprod_kernel(const float* input, float* output, int M, int N) {
-    int row = blockIdx.x;
-    const float* row_in = input + row * N;
-    float* row_out = output + row * N;
+struct ScanCtx {
+  const float *d_in;
+  float *d_out;
+  float *d_tiles;
+  int M, N;
+  int which; // 0 naive, 1 fast
+};
 
-    if (threadIdx.x == 0) {
-        float prod = 1.0f;
-        for (int i = 0; i < N; ++i) {
-            prod *= row_in[i];
-            row_out[i] = prod;
-        }
-    }
+void scan_launch_cb(void *p) {
+  auto *c = (ScanCtx *)p;
+  if (c->which == 0) launch_scan_naive(c->d_in, c->d_out, c->M, c->N);
+  else launch_scan_fast(c->d_in, c->d_out, c->d_tiles, c->M, c->N);
 }
 
-// ---- 1D Running Sum ----
-// output[i] = sum(input[max(0,i-K+1)..i])
-// 即滑动窗口求和
-__global__ void running_sum_kernel(const float* input, float* output, int N, int K) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < N) {
-        float sum = 0.0f;
-        int start = max(0, idx - K + 1);
-        for (int i = start; i <= idx; ++i) {
-            sum += input[i];
-        }
-        output[idx] = sum;
-    }
+bool run_case(int M, int N, bool run_naive) {
+  const int n = M * N;
+  const int tiles = CEIL_DIV(N, kTile);
+  printf("===== Prefix Sum  M=%d  N=%d  (tiles/row=%d) =====\n", M, N, tiles);
+
+  std::vector<float> h_in(n), h_cpu(n), h_gpu(n);
+  srand(42);
+  for (int i = 0; i < n; ++i)
+    h_in[i] = (rand() / (float)RAND_MAX) * 2.f - 1.f;
+
+  scan_cpu(h_in.data(), h_cpu.data(), M, N);
+
+  float *d_in = nullptr, *d_out = nullptr, *d_tiles = nullptr;
+  CUDA_CHECK(cudaMalloc(&d_in, n * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_out, n * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_tiles, (size_t)M * tiles * sizeof(float)));
+  CUDA_CHECK(cudaMemcpy(d_in, h_in.data(), n * sizeof(float),
+                        cudaMemcpyHostToDevice));
+
+  ScanCtx ctx{d_in, d_out, d_tiles, M, N, 1};
+  int warmup = 5, rep = 20;
+  if (n > 4 * 1024 * 1024) {
+    warmup = 3;
+    rep = 10;
+  }
+
+  float ms_fast = bench_ms(scan_launch_cb, &ctx, warmup, rep);
+  CUDA_CHECK(cudaMemcpy(h_gpu.data(), d_out, n * sizeof(float),
+                        cudaMemcpyDeviceToHost));
+  float diff_fast = max_abs_diff(h_gpu.data(), h_cpu.data(), n);
+  // 并行加法结合律不同，N 越大误差越大
+  float tol = 5e-4f * N + 1e-4f;
+  bool ok_fast = diff_fast < tol;
+  printf("  [fast ] %7.4f ms  max_diff=%.3e  %s\n", ms_fast, diff_fast,
+         ok_fast ? "PASS" : "FAIL");
+
+  bool ok_naive = true;
+  if (run_naive) {
+    ctx.which = 0;
+    float ms_naive = bench_ms(scan_launch_cb, &ctx, warmup, rep);
+    CUDA_CHECK(cudaMemcpy(h_gpu.data(), d_out, n * sizeof(float),
+                          cudaMemcpyDeviceToHost));
+    float diff_naive = max_abs_diff(h_gpu.data(), h_cpu.data(), n);
+    ok_naive = diff_naive < 1e-4f;
+    printf("  [naive] %7.4f ms  max_diff=%.3e  %s\n", ms_naive, diff_naive,
+           ok_naive ? "PASS" : "FAIL");
+    printf("  speedup vs naive: %.2fx\n", ms_naive / ms_fast);
+  }
+
+  double bytes = 2.0 * n * sizeof(float); // read in + write out
+  printf("  effective BW (fast): %.1f GB/s\n",
+         bytes / (ms_fast * 1e-3) / 1e9);
+  printf("\n");
+
+  CUDA_CHECK(cudaFree(d_in));
+  CUDA_CHECK(cudaFree(d_out));
+  CUDA_CHECK(cudaFree(d_tiles));
+  return ok_fast && ok_naive;
 }
 
-// 使用前缀和加速 running sum
-// output[i] = prefix[i+1] - prefix[max(0, i-K+1)]
-__global__ void running_sum_prefix_kernel(const float* prefix_sum, float* output, int N, int K) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < N) {
-        int start = max(0, idx - K + 1);
-        output[idx] = prefix_sum[idx + 1] - prefix_sum[start];
-    }
-}
+int main() {
+  int dev = 0;
+  cudaDeviceProp prop{};
+  CUDA_CHECK(cudaGetDeviceProperties(&prop, dev));
+  printf("GPU: %s  sm_%d%d  mem=%.1f GB\n\n", prop.name, prop.major,
+         prop.minor, prop.totalGlobalMem / 1e9);
 
-// ==================== Torch Bindings ====================
+  bool ok = true;
+  ok &= run_case(4, 16, true);           // 极小
+  ok &= run_case(32, 128, true);         // 小于一个 tile
+  ok &= run_case(1024, 1024, true);      // 正好一个 tile / 行
+  ok &= run_case(256, 4096, true);       // 多 tile
+  ok &= run_case(1, 8 * 1024 * 1024, false); // 大 1D，跳过 naive
 
-torch::Tensor torch_cumsum_naive(torch::Tensor input) {
-    CHECK_TORCH_TENSOR_DTYPE(input, torch::kFloat32);
-    int M = input.size(0), N = input.size(1);
-    auto output = torch::empty_like(input);
-    cumsum_naive_kernel<<<M, 1>>>(input.data_ptr<float>(), output.data_ptr<float>(), M, N);
-    return output;
-}
-
-torch::Tensor torch_cumsum_parallel(torch::Tensor input) {
-    CHECK_TORCH_TENSOR_DTYPE(input, torch::kFloat32);
-    int M = input.size(0), N = input.size(1);
-    auto output = torch::empty_like(input);
-    if (N <= 1024) {
-        // N fits in one block
-        int block = N;
-        // round up to power of 2
-        int p = 1;
-        while (p < block) p <<= 1;
-        block = p;
-        size_t smem = 2 * block * sizeof(float);
-        cumsum_parallel_kernel<<<M, block, smem>>>(
-            input.data_ptr<float>(), output.data_ptr<float>(), M, N);
-    } else {
-        // Fallback to large kernel
-        cumsum_large_kernel<<<M, 1>>>(
-            input.data_ptr<float>(), output.data_ptr<float>(), N);
-    }
-    return output;
-}
-
-torch::Tensor torch_cumprod(torch::Tensor input) {
-    CHECK_TORCH_TENSOR_DTYPE(input, torch::kFloat32);
-    int M = input.size(0), N = input.size(1);
-    auto output = torch::empty_like(input);
-    cumprod_kernel<<<M, 1>>>(input.data_ptr<float>(), output.data_ptr<float>(), M, N);
-    return output;
-}
-
-torch::Tensor torch_running_sum(torch::Tensor input, int K) {
-    CHECK_TORCH_TENSOR_DTYPE(input, torch::kFloat32);
-    int N = input.numel();
-    auto output = torch::empty_like(input);
-    int block = 256;
-    int grid = CEIL(N, block);
-    running_sum_kernel<<<grid, block>>>(input.data_ptr<float>(), output.data_ptr<float>(), N, K);
-    return output;
-}
-
-torch::Tensor torch_running_sum_prefix(torch::Tensor input, int K) {
-    CHECK_TORCH_TENSOR_DTYPE(input, torch::kFloat32);
-    int N = input.numel();
-    // Compute prefix sum first using torch
-    auto prefix = torch::zeros({N + 1}, input.options());
-    // prefix[1:] = cumsum(input)
-    prefix.slice(0, 1, N + 1).copy_(input.cumsum(0));
-    
-    auto output = torch::empty_like(input);
-    int block = 256;
-    int grid = CEIL(N, block);
-    running_sum_prefix_kernel<<<grid, block>>>(prefix.data_ptr<float>(), output.data_ptr<float>(), N, K);
-    return output;
-}
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    TORCH_BINDING_COMMON_EXTENSION(torch_cumsum_naive)
-    TORCH_BINDING_COMMON_EXTENSION(torch_cumsum_parallel)
-    TORCH_BINDING_COMMON_EXTENSION(torch_cumprod)
-    TORCH_BINDING_COMMON_EXTENSION(torch_running_sum)
-    TORCH_BINDING_COMMON_EXTENSION(torch_running_sum_prefix)
+  printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
+  return ok ? 0 : 1;
 }

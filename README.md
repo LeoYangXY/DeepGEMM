@@ -1,98 +1,107 @@
-参考了leet-cuda
+# learn-cuda-cute-triton
 
-## 📖 100+ 高性能计算与分布式-技术博客
+练 GPU kernel：裸 CUDA → PTX → CuTeDSL / Triton → Hopper FA3 → 微架构实测。
 
-### 📚 高性能计算与分布式-技术博客推荐 ([©️back👆🏻](#contents))
+原生 CUDA 参考 [leet-cuda](https://github.com/xlite-dev/leetcuda)。环境：`source setup_env.sh`。博客：[reading/blogs.md](reading/blogs.md)。
 
-<div id="other-blogs"></div>
+| 目录 | 干什么 |
+|:---|:---|
+| [`origin_cuda_kernel/`](#origin_cuda_kernel) | 手写 CUDA 算子 |
+| [`ptx_asm/`](#ptx_asm) | 内联 PTX，拼到 HGEMM |
+| [`cutedsl_tutorial/`](#cutedsl_tutorial) | CuTeDSL 入门教程 |
+| [`cutedsl_ref/`](#cutedsl_ref) | 用 CuTe 对照重写裸 CUDA 算子 |
+| [`triton/`](#triton) | 同一批算子的 Triton 版 |
+| [`hopper_fa3/`](#hopper_fa3) | Hopper 上写 FA3，和官方比 |
+| [`micro_bench/`](#micro_bench) | H20 微架构实测数字 |
+| [`profile/`](#profile) | nsys / ncu 看慢在哪 |
+| [`reading/`](#reading) | 博客清单 |
 
-💡说明: 本小节整理一些自己比较喜欢的文章。欢迎大家提PR推荐更多优秀的文章！
+---
 
-|📖 类型-标题|📖 作者| 📖 推荐 |
-|:---|:---|:---|
-| ~~[[cute系列详解][Swizzle]📖cute Swizzle细谈~~](https://zhuanlan.zhihu.com/p/684250988)|@进击的Killua|⭐️⭐️⭐️|
-| [~~[cute系列详解][Swizzle]📖cutlass swizzle机制解析（一）~~](https://zhuanlan.zhihu.com/p/710337546)|@Titus|⭐️⭐️⭐️|
-| [~~[cute系列详解][Swizzle]📖cutlass swizzle机制解析（二）~~](https://zhuanlan.zhihu.com/p/711398930)|@Titus|⭐️⭐️⭐️|
-| [~~[cute系列详解][Swizzle]📖CUDA避免smem bank conflict的swizzle机制解析~~](https://zhuanlan.zhihu.com/p/4746910252)|@frankshi|⭐️⭐️⭐️|
-| [~~[cute系列详解][GEMM]📖GEMM细节分析(三): Swizzle<B,M,S>参数取值~~](https://zhuanlan.zhihu.com/p/713713957)|@Anonymous|⭐️⭐️⭐️|
-| [~~[cutlass教程][深入]📖cutlass block swizzle 和 tile iterator~~](https://zhuanlan.zhihu.com/p/679929705)|@JoeNomad|⭐️⭐️⭐️|
-| [~~[cutlass教程][深入]📖cutlass bank conflict free的smem layout~~](https://zhuanlan.zhihu.com/p/681966685)|@JoeNomad|⭐️⭐️⭐️|
+## origin_cuda_kernel
 
-| [~~[cute系列详解][GEMM]📖GEMM流水线: single/multi-stage、pipeline~~](https://zhuanlan.zhihu.com/p/712451053)|@Titus|⭐️⭐️⭐️|
-| [~~[cute系列详解][GEMM]📖GEMM细节分析(一): ldmatrix的选择~~](https://zhuanlan.zhihu.com/p/702818267)|@Anonymous|⭐️⭐️⭐️|
-| [~~[cute系列详解][GEMM]📖GEMM细节分析(二): TiledCopy与cp.async~~](https://zhuanlan.zhihu.com/p/703560147)|@Anonymous|⭐️⭐️⭐️|
-| [~~[cute系列详解][实践]📖Hopper Mixed GEMM的CUTLASS实现笔记~~](https://zhuanlan.zhihu.com/p/714378343)|@BBuf|⭐️⭐️⭐️|
-| [~~[cutlass教程][深入]📖cutlass 多级流水线~~](https://zhuanlan.zhihu.com/p/687397095)|@JoeNomad|⭐️⭐️⭐️|
-| [~~[CUDA优化][入门]📖CUDA 入门的正确姿势：how-to-optimize-gemm~~](https://zhuanlan.zhihu.com/p/478846788)|@白牛|⭐️⭐️⭐️|
-| [~~[CUDA优化][实践]📖CUDA（三）：通用矩阵乘法：从入门到熟练~~](https://zhuanlan.zhihu.com/p/657632577)|@紫气东来|⭐️⭐️⭐️|
-| [~~[CUDA优化][实践]📖ops(1)：LayerNorm 算子的 CUDA 实现与优化~~](https://zhuanlan.zhihu.com/p/694974164)|@紫气东来|⭐️⭐️⭐️|
-| [~~[CUDA优化][实践]📖ops(2)：SoftMax算子的 CUDA 实现~~](https://zhuanlan.zhihu.com/p/695307283)|@紫气东来|⭐️⭐️⭐️|
-| [~~[CUDA优化][实践]📖ops(3)：Cross Entropy 的 CUDA 实现~~](https://zhuanlan.zhihu.com/p/695594396)|@紫气东来|⭐️⭐️⭐️|
-| [~~[CUDA优化][实践]📖ops(4)：AdamW 优化器的 CUDA 实现~~](https://zhuanlan.zhihu.com/p/695611950)|@紫气东来|⭐️⭐️⭐️|
-| [~~[CUDA优化][实践]📖ops(5)：激活函数与残差连接的 CUDA 实现~~](https://zhuanlan.zhihu.com/p/695703671)|@紫气东来|⭐️⭐️⭐️|
-| [~~[CUDA优化][实践]📖ops(6)：embedding 层与 LM head 层的 CUDA 实现~~](https://zhuanlan.zhihu.com/p/695785781)|@紫气东来|⭐️⭐️⭐️|
-| [~~[CUDA优化][实践]📖ops(7)：self-attention 的 CUDA 实现及优化 (上)~~](https://zhuanlan.zhihu.com/p/695898274)|@紫气东来|⭐️⭐️⭐️|
-| [~~[CUDA优化][实践]📖ops(8)：self-attention 的 CUDA 实现及优化 (下)~~](https://zhuanlan.zhihu.com/p/696197013)|@紫气东来|⭐️⭐️⭐️|
-| [~~[CUDA优化][实践]📖CUDA（四）：使用 CUDA 实现 Transformer 结构~~](https://zhuanlan.zhihu.com/p/694416583)|@紫气东来|⭐️⭐️⭐️|
-| [~~[CUDA优化][Copy]📖Async Copy及Memory Barrier指令的功能与实现~~](https://zhuanlan.zhihu.com/p/685168850)|@Frank Wang|⭐️⭐️⭐️|
-| [~~[GPU通信架构][精解]📖NVIDIA GPGPU（四）- 通信架构~~](https://zhuanlan.zhihu.com/p/680262016)|@Bruce|⭐️⭐️⭐️|
-| [~~[cute系列详解][入门]📖cutlass cute 101~~](https://zhuanlan.zhihu.com/p/660379052)|@朱小霖|⭐️⭐️⭐️|
-| [~~[cute系列详解][入门]📖CUTLASS 2.x & CUTLASS 3.x Intro 学习笔记~~](https://zhuanlan.zhihu.com/p/710516489)|@BBuf|⭐️⭐️⭐️|
-| [~~[cute系列详解][Layout]📖cute 之 Layout~~](https://zhuanlan.zhihu.com/p/661182311)|@reed|⭐️⭐️⭐️|
-| [~~[cute系列详解][Layout]📖cute Layout 的代数和几何解释~~](https://zhuanlan.zhihu.com/p/662089556)|@reed|⭐️⭐️⭐️|
-| [~~[cute系列详解][Tensor]📖cute 之 Tensor~~](https://zhuanlan.zhihu.com/p/663093816)|@reed|⭐️⭐️⭐️|
-| [~~[cute系列详解][MMA]📖cute 之 MMA抽象~~](https://zhuanlan.zhihu.com/p/663092747)|@reed|⭐️⭐️⭐️|
-| [~~[cute系列详解][Copy]📖cute 之 Copy抽象~~](https://zhuanlan.zhihu.com/p/666232173)|@reed|⭐️⭐️⭐️|
-| [~~[cute系列详解][GEMM]📖cute 之 简单GEMM实现~~](https://zhuanlan.zhihu.com/p/667521327)|@reed|⭐️⭐️⭐️|
-| [~~[cute系列详解][GEMM]📖cute 之 GEMM流水线~~](https://zhuanlan.zhihu.com/p/665082713)|@reed|⭐️⭐️⭐️|
-| [~~[cute系列详解][GEMM]📖cute 之 高效GEMM实现~~](https://zhuanlan.zhihu.com/p/675308830)|@reed|⭐️⭐️⭐️|
-| [~~[cute系列详解][Swizzle]📖cute 之 Swizzle~~](https://zhuanlan.zhihu.com/p/671419093)|@reed|⭐️⭐️⭐️|
-| [~~[cute系列详解][实践]📖CUTLASS CuTe实战(一): 基础~~](https://zhuanlan.zhihu.com/p/690703999)|@进击的Killua|⭐️⭐️⭐️|
-| [~~[cute系列详解][实践]📖CUTLASS CuTe实战(二): 应用~~](https://zhuanlan.zhihu.com/p/692078624)|@进击的Killua|⭐️⭐️⭐️|
-| [~~[cute系列详解][实践]📖FlashAttention fp8实现（ada架构)~~](https://zhuanlan.zhihu.com/p/712314257)|@shengying.wei|⭐️⭐️⭐️|
-| [~~[cute系列详解][实践]📖FlashAttention 笔记: tiny-flash-attention解读~~](https://zhuanlan.zhihu.com/p/708867810)|@shengying.wei|⭐️⭐️⭐️|
-| [~~[cute系列详解][实践]📖使用cutlass cute复现flash attention~~](https://zhuanlan.zhihu.com/p/696323042)|@66RING|⭐️⭐️⭐️|
-| [~~[cutlass教程][入门]📖cutlass 基本认知~~](https://zhuanlan.zhihu.com/p/677616101)|@JoeNomad|⭐️⭐️⭐️|
-| [~~[cutlass教程][入门]📖cutlass 软件架构~~](https://zhuanlan.zhihu.com/p/678915618)|@JoeNomad|⭐️⭐️⭐️|
-| [~~[cutlass教程][入门]📖CUTLASS 基础介绍~~](https://zhuanlan.zhihu.com/p/671324125)|@进击的Killua|⭐️⭐️⭐️|
-| [~~[cutlass教程][入门]📖乱谈CUTLASS GTC2020 SLIDES~~](https://zhuanlan.zhihu.com/p/674693873)|@zzk again|⭐️⭐️⭐️|
-| [~~[GPU指令集架构][精解]📖NVidia GPU指令集架构-前言~~](https://zhuanlan.zhihu.com/p/686198447)|@reed|⭐️⭐️⭐️|
-| [~~[GPU指令集架构][精解]📖NVidia GPU指令集架构-寄存器~~](https://zhuanlan.zhihu.com/p/688616037)|@reed|⭐️⭐️⭐️|
-| [~~[GPU指令集架构][精解]📖NVidia GPU指令集架构-Load和Cache~~](https://zhuanlan.zhihu.com/p/692445145)|@reed|⭐️⭐️⭐️|
-| [~~[GPU指令集架构][精解]📖NVidia GPU指令集架构-浮点运算~~](https://zhuanlan.zhihu.com/p/695667044)|@reed|⭐️⭐️⭐️|
-| [~~[GPU指令集架构][精解]📖NVidia GPU指令集架构-整数运算~~](https://zhuanlan.zhihu.com/p/700921948)|@reed|⭐️⭐️⭐️|
-| [~~[GPU指令集架构][精解]📖NVidia GPU指令集架构-比特和逻辑操作~~](https://zhuanlan.zhihu.com/p/712356884)|@reed|⭐️⭐️⭐️|
-| [~~[GPU指令集架构][精解]📖NVidia GPU指令集架构-Warp级和Uniform操作~~](https://zhuanlan.zhihu.com/p/712357647)|@reed|⭐️⭐️⭐️|
-| [~~[CUDA优化][入门]📖CUDA（一）：CUDA 编程基础~~](https://zhuanlan.zhihu.com/p/645330027)|@紫气东来|⭐️⭐️⭐️|
-| [~~[CUDA优化][入门]📖CUDA（二）：GPU的内存体系及其优化指南~~](https://zhuanlan.zhihu.com/p/654027980)|@紫气东来|⭐️⭐️⭐️|
-| [~~[CUDA优化][GEMV]📖深入浅出GPU优化系列：gemv优化~~](https://zhuanlan.zhihu.com/p/494144694)|@有了琦琦的棍子|⭐️⭐️⭐️|
-| [~~[CUDA优化][实践]📖CUDA element-wise 算子详解~~](https://zhuanlan.zhihu.com/p/1888630735520391519)|@懒蚂蚁呀不嘿|⭐️⭐️⭐️|
-| [~~[CUDA优化][实践]📖CUDA transpose 算子详解~~](https://zhuanlan.zhihu.com/p/1899760505733756129)|@懒蚂蚁呀不嘿|⭐️⭐️⭐️|
-| [~~[CUDA优化][实践]📖CUDA reduce 算子详解~~](https://zhuanlan.zhihu.com/p/1905661893739283464)|@懒蚂蚁呀不嘿|⭐️⭐️⭐️|
-| [~~[CUDA优化][实践]📖CUDA GEMM 算子详解~~](https://zhuanlan.zhihu.com/p/1910636263666610461)|@懒蚂蚁呀不嘿|⭐️⭐️⭐️|
-| [~~[Tensor Cores]📖Nvidia Tensor Core初探~~](https://zhuanlan.zhihu.com/p/620185229)|@木子知|⭐️⭐️⭐️|
-| [~~[Tensor Cores]📖Nvidia Tensor Core-WMMA API编程入门~~](https://zhuanlan.zhihu.com/p/620766588)|@木子知|⭐️⭐️⭐️|
-| [~~[Tensor Cores]📖Nvidia Tensor Core-MMA PTX编程入门~~](https://zhuanlan.zhihu.com/p/621855199)|@木子知|⭐️⭐️⭐️|
-| [~~[Tensor Cores]📖CUDA Ampere Tensor Core HGEMM 矩阵乘法优化~~](https://zhuanlan.zhihu.com/p/555339335)|@nicholaswilde|⭐️⭐️⭐️|
+裸 CUDA 写算子。单文件、以 fp32 / fp16 为主，向量化用 `float4` / `half2` / 128-bit pack。
 
+- `add/`：逐元素加，1 → 4 → 8 元素/线程
+- `embedding/` `transpose/` `reduce_max/` `softmax/` `layer_norm/` `sgemv/`：查表、转置、归约、softmax、LN、GEMV
+- `sgemm/`：naive → tiling / double buffer / `cp.async` → WMMA / TMA + warp spec
+- `other/`：scan、topk、sort、conv、pooling、loss、量化、图、FA、fused add+rmsnorm 等
+- `plan.md`：Tensara 题目覆盖
 
-<div id="my-blogs-part-1"></div>
+练的是：合并访存、shared memory、warp shuffle、流水线。
 
-### 📚 高性能计算与分布式-个人技术专栏 ([©️back👆🏻](#contents))
+---
 
-|📖 类型-标题|📖 作者| 📖 推荐 |
-|:---|:---|:---|
-| [~~[Triton编程][基础]📖Triton极简入门: Triton Vector Add~~](https://zhuanlan.zhihu.com/p/1902778199261291694)|@DefTruth|⭐️⭐️⭐|
-| [~~[Triton编程][基础]📖Triton Fused Softmax Kernel详解: 从Python源码到PTX~~](https://zhuanlan.zhihu.com/p/1899562146477609112)|@DefTruth|⭐️⭐️⭐|
-| [~~[Triton编程][基础]📖vLLM Triton Merge Attention States Kernel详解~~](https://zhuanlan.zhihu.com/p/1904937907703243110)|@DefTruth|⭐️⭐️⭐|
-| [~~[Triton编程][进阶]📖vLLM Prefix Prefill Triton Kernel图解~~](https://zhuanlan.zhihu.com/p/695799736)|@DefTruth|⭐️⭐️⭐️|
-| [~~[vLLM实践][算子]📖vLLM算子开发流程：”保姆级“详细记录~~](https://zhuanlan.zhihu.com/p/1892966682634473987)|@DefTruth|⭐️⭐️⭐|
-| [~~[LLM推理优化][CUDA][3w字]📖高频面试题汇总-大模型手撕CUDA~~](https://zhuanlan.zhihu.com/p/678903537)|@DefTruth|⭐️⭐️⭐️|
+## ptx_asm
 
-| [~~[技术随笔][C++][3W字]📖静态链接和静态库实践指北-原理篇~~](https://zhuanlan.zhihu.com/p/595527528)|@DefTruth|⭐️⭐️⭐️|
+不用 CUTLASS，内联 PTX 控指令。按编号看：
 
-| [~~[torch.compile][原理]📖Torch.compile流程解析: 介绍~~](https://zhuanlan.zhihu.com/p/9418379234)|@StarCap|⭐️⭐️⭐️|
-| [~~[torch.compile][原理]📖一文搞懂TorchDynamo原理~~](https://zhuanlan.zhihu.com/p/630933479)|@吾乃阿尔法|⭐️⭐️⭐️|
-| [~~[torch.compile][原理]📖理解torch.compile基本原理和使用方式~~](https://zhuanlan.zhihu.com/p/12712224407)|@俯仰|⭐️⭐️⭐️|
+1. `01_basics` — `asm volatile`、访存、barrier、atomic、shuffle
+2. `02_cp_async` — GMEM → SMEM 异步拷、double buffer
+3. `03_ldmatrix` — SMEM 按 TC layout 装寄存器
+4. `04_mma` — `mma.sync` m16n8k16
+5. `05_hgemm_mma` — 上面串成带流水的 HGEMM
+6. `06_hopper_wgmma_tma` — wgmma / TMA / mbarrier / cluster
+7. `07` `08` — 类型转换、cache / prefetch
 
+后面还有 TMA 争用、syncwarp、SFU 等小实验。
 
+---
+
+## cutedsl_tutorial
+
+可跑的 Python 教程，从 hello 到 Flash Attention。
+
+- 01–02：kernel / Layout（shape + stride）
+- 03–04：tiling、TiledMMA、smem、异步流水
+- 05–07：WMMA；Hopper TMA+WGMMA；Blackwell tcgen05（后两篇要对应卡）
+- 08+：SDPA / FA V1 V2、TiledCopy、swizzle、persistent kernel
+
+---
+
+## cutedsl_ref
+
+用 CuTeDSL 重写 `origin_cuda_kernel/` 里的 add / embedding / transpose / reduce / GEMM / LN。对照看 Layout、copy atom、MMA 数据流。
+
+- `sgemm_explained.md`：GMEM → SMEM → 寄存器 → TC → 写回（CuTe vs 裸 CUDA）
+- `CUTE_API_CHEATSHEET.md`：API 速查
+
+---
+
+## triton
+
+同一批算子：add、reduce、softmax、LN、GEMM，以及 `flash_attention/` 的 V1 / V2。看 Triton 帮你藏了什么、还得自己管什么。
+
+---
+
+## hopper_fa3
+
+写 FA3 的最小实验台。只改 `csrc/my_fa3_kernel.cu`，`run.py` 和官方 FA3（或 SDPA）比正确性和速度。
+
+- `01_hopper_features.cu`：cluster、WGMMA、DSMEM、warp spec、TMA multicast
+- 改完：`python3 run.py`；自己的 attention 写完加 `--real`
+
+---
+
+## micro_bench
+
+H20（sm_90）真机数字，不是文档抄的。每个 `m_*.cu` 测一件事：访存、L2、延迟、occupancy / ILP、smem、swizzle、cp.async、TC、同步、launch、NVLink。
+
+结论在本目录 `README.md`。`nvlink/` 另有 30+ 个实验（粒度、条带、原子、fence、组播）。
+
+---
+
+## profile
+
+nsys / ncu。
+
+- `ncu_sections_cheatsheet.md`：SOL 看 bound，WarpState 看 stall
+- `profile_learning.md`：以 FA3 为主线的 profile 计划
+- `study/`：stall、roofline、TMA 等小 demo
+- `gemm/`：一次 TMA pipeline 调参记录
+
+---
+
+## reading
+
+博客在 [reading/blogs.md](reading/blogs.md)。

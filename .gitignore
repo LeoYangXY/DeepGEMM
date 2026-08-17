@@ -1,12 +1,33 @@
-# Compiled executables (no extension on Linux)
-ptx_asm/01_basics/ptx_basics
-ptx_asm/02_cp_async/cp_async
-ptx_asm/03_ldmatrix/ldmatrix
-ptx_asm/04_mma/mma
-ptx_asm/05_hgemm_mma/hgemm
-ptx_asm/06_hopper_wgmma_tma/hopper
-ptx_asm/07_type_convert/type_convert
-ptx_asm/08_memory_control/memctrl
+# Compiled Linux executables (no extension). Keep sources and Makefiles.
+ptx_asm/**/*
+!ptx_asm/**/
+!ptx_asm/**/*.*
+
+origin_cuda_kernel/**/*
+!origin_cuda_kernel/**/
+!origin_cuda_kernel/**/*.*
+!origin_cuda_kernel/**/Makefile
+
+profile/study/**/*
+!profile/study/**/
+!profile/study/**/*.*
+
+# Profiler reports and ad-hoc dumps (must come AFTER !*.* un-ignores)
+*.ncu-rep
+*.nsys-rep
+*.txt
+!**/requirements.txt
+
+# nvcc host/device compiler intermediates
+*.cpp1.ii
+*.cpp4.ii
+*.cudafe1.c
+*.cudafe1.cpp
+*.cudafe1.gpu
+*.cudafe1.stub.c
+*.fatbin.c
+*.reg.c
+*.module_id
 
 # Build artifacts
 *.o

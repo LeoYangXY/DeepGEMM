@@ -5,7 +5,7 @@ from torch.utils.cpp_extension import load
 from functools import partial
 
 
-def load_cuda(cuda_src: str, funcs: list[str], extra_cuda_cflags: list[str] = None, extra_include_paths: list[str] = None, verbose: bool = False):
+def load_cuda(cuda_src: str, funcs: list[str], extra_cuda_cflags: list[str] = None, extra_include_paths: list[str] = None, extra_ldflags: list[str] = None, verbose: bool = False):
     """JIT compile and load a CUDA extension.
     
     Args:
@@ -13,6 +13,7 @@ def load_cuda(cuda_src: str, funcs: list[str], extra_cuda_cflags: list[str] = No
         funcs: list of function names exported via pybind11
         extra_cuda_cflags: additional nvcc flags
         extra_include_paths: additional include directories (e.g. for cutlass)
+        extra_ldflags: additional linker flags (e.g. ["-lcuda"] for driver API)
         verbose: whether to print compilation output
     """
     cuda_cflags = [
@@ -37,6 +38,7 @@ def load_cuda(cuda_src: str, funcs: list[str], extra_cuda_cflags: list[str] = No
         sources=[cuda_src],
         extra_cuda_cflags=cuda_cflags,
         extra_include_paths=extra_include_paths or [],
+        extra_ldflags=extra_ldflags or [],
         build_directory=build_dir,
         verbose=verbose,
     )
