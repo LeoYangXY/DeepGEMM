@@ -1,0 +1,3 @@
+[submodule "DeepGEMM"]
+	path = DeepGEMM
+	url = https://github.com/LeoYangXY/DeepGEMM.git
